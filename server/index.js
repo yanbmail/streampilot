@@ -4,12 +4,13 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const url = require('url');
+const { once } = require('events');
 const { Store } = require('./config');
 const { jobDefaults, normalizeJob, buildTargetUrl, applyTemplate } = require('./config');
 const { FFmpegService } = require('./ffmpeg');
 const { JobManager } = require('./jobs');
 const { IPTVService } = require('./iptv');
-const { PreviewService, proxyHls, MIME } = require('./preview');
+const { PreviewService, proxyHls, MIME, rewritePlaylist } = require('./preview');
 const { RtmpServer } = require('./rtmp-server');
 const { Scheduler } = require('./scheduler');
 const {
@@ -102,6 +103,15 @@ async function createApp(options = {}) {
     if (globalLogs.length > 1500) globalLogs.shift();
     broadcast('log', entry);
   });
+
+  /** 往运行日志里写一条（播放器/系统类事件，页面「运行日志」能看到） */
+  function noteLog(level, line, jobId = 'player') {
+    const entry = { t: Date.now(), jobId, level, line };
+    globalLogs.push(entry);
+    if (globalLogs.length > 1500) globalLogs.shift();
+    broadcast('log', entry);
+    return entry;
+  }
   jobs.on('state', (s) => broadcast('job-state', { ...s, runtime: jobs.runtime(s.jobId) }));
   jobs.on('stats', ({ jobId, stats }) => {
     pendingStats.set(jobId, stats);
@@ -638,7 +648,11 @@ async function createApp(options = {}) {
           userAgent: body.userAgent || store.config.settings.player.userAgent,
           headers: body.headers || (body.referer ? `Referer: ${body.referer}` : '') || ch?.headers || '',
         };
-        const result = await preview.play(src, { mode: body.mode, bitrateKbps: body.bitrateKbps });
+        const result = await preview.play(src, { mode: body.mode, bitrateKbps: body.bitrateKbps })
+          .catch((err) => {
+            noteLog('warn', `播放失败：${src.url} —— ${err.message}`);
+            throw err;
+          });
         if (ch) {
           const p = store.config.player;
           p.history = [{ ...ch, playedAt: Date.now() }, ...(p.history || []).filter((h) => h.url !== ch.url)].slice(0, 40);
@@ -722,23 +736,22 @@ async function createApp(options = {}) {
         return sendJson(res, 200, { ok: false, error: '当前为浏览器模式，无法打开本地目录' });
       }
 
-      // ---------- HLS 反代 ----------
+      // ---------- 播放反代（HLS / FLV / 普通文件） ----------
       if (pathname === '/api/proxy') {
         const target = String(query.u || '');
         if (!/^https?:\/\//i.test(target)) return sendJson(res, 400, { ok: false, error: '仅支持 http(s) 地址' });
+        const ua = query.ua || store.config.settings.player.userAgent;
+        const ref = query.ref || store.config.settings.player.referer;
         const kind = urlKind(target);
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 30000);
+        res.on('close', () => { try { ctrl.abort(); } catch (_) {} });
         try {
+          // 已知是 HLS 的走原逻辑（能正确处理主播放列表与分片）
           if (kind === 'hls') {
-            const { playlist, body, res: upstream, raw, contentType } = await proxyHls(target, {
-              userAgent: query.ua || store.config.settings.player.userAgent,
-              referer: query.ref || store.config.settings.player.referer,
-            });
+            const { playlist, body, res: upstream, raw, contentType } = await proxyHls(target, { userAgent: ua, referer: ref });
             if (playlist) {
-              res.writeHead(200, {
-                'Content-Type': MIME['.m3u8'],
-                'Cache-Control': 'no-store',
-                'Access-Control-Allow-Origin': '*',
-              });
+              res.writeHead(200, { 'Content-Type': MIME['.m3u8'], 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' });
               return res.end(body);
             }
             if (raw) {
@@ -752,27 +765,78 @@ async function createApp(options = {}) {
             }
             return pipeUpstream(upstream, res, req);
           }
-          const ctrl = new AbortController();
-          const timer = setTimeout(() => ctrl.abort(), 30000);
+
           const upstream = await fetch(target, {
             signal: ctrl.signal,
             redirect: 'follow',
             headers: {
-              'User-Agent': query.ua || store.config.settings.player.userAgent,
-              ...(query.ref ? { Referer: query.ref } : (store.config.settings.player.referer ? { Referer: store.config.settings.player.referer } : {})),
+              'User-Agent': ua || 'Mozilla/5.0 StreamPilot/1.0',
+              ...(ref ? { Referer: ref } : {}),
               ...(req.headers.range ? { Range: req.headers.range } : {}),
               Accept: '*/*',
             },
           });
-          clearTimeout(timer);
-          if (!upstream.ok && upstream.status !== 206) {
-            return sendJson(res, 502, { ok: false, error: `源站返回 HTTP ${upstream.status}` });
+          const ctype = (upstream.headers.get('content-type') || '').toLowerCase();
+          if (!upstream.ok) {
+            try { await upstream.body?.cancel(); } catch (_) {}
+            const msg = upstream.status === 404 ? '源站返回 404，该频道链接已失效'
+              : upstream.status === 403 ? '源站返回 403，拒绝访问（可能有防盗链或地区限制）'
+                : `源站返回 HTTP ${upstream.status}`;
+            return sendJson(res, 502, { ok: false, error: msg });
           }
-          return pipeUpstream(upstream, res, req);
+          // 播放列表：不依赖后缀，按 content-type 判断
+          if (/mpegurl/.test(ctype)) {
+            const text = await upstream.text();
+            res.writeHead(200, { 'Content-Type': MIME['.m3u8'], 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' });
+            return res.end(rewritePlaylist(text, upstream.url || target));
+          }
+          // 明确的音视频二进制 → 直接透传
+          if (/^(video|audio)\//.test(ctype) || ctype.includes('flv')) {
+            return pipeUpstream(upstream, res, req);
+          }
+          // 其余先读首块判断：无扩展名的 m3u8 常见于 text/plain、octet-stream
+          const reader = upstream.body?.getReader();
+          if (!reader) return sendJson(res, 502, { ok: false, error: '源站没有返回内容' });
+          const first = await reader.read();
+          const head = first.value ? Buffer.from(first.value) : Buffer.alloc(0);
+          const text = head.toString('utf8').trim();
+          if (/^\uFEFF?#EXTM3U/i.test(text)) {
+            const chunks = [head];
+            let total = head.length;
+            while (total < 1 << 20) {
+              const r = await reader.read();
+              if (r.done) break;
+              if (r.value) { chunks.push(Buffer.from(r.value)); total += r.value.length; }
+            }
+            try { await reader.cancel(); } catch (_) {}
+            res.writeHead(200, { 'Content-Type': MIME['.m3u8'], 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' });
+            return res.end(rewritePlaylist(Buffer.concat(chunks).toString('utf8'), upstream.url || target));
+          }
+          if (/^<(!doctype|html|\?xml)/i.test(text)) {
+            try { await reader.cancel(); } catch (_) {}
+            return sendJson(res, 502, { ok: false, error: '这个地址返回的是网页，不是视频流（可能需要登录或已失效）' });
+          }
+          res.writeHead(200, {
+            'Content-Type': ctype || 'application/octet-stream',
+            'Cache-Control': 'no-store',
+            'Access-Control-Allow-Origin': '*',
+          });
+          if (head.length) res.write(head);
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            if (!value) continue;
+            if (!res.write(Buffer.from(value))) await once(res, 'drain').catch(() => {});
+          }
+          return res.end();
         } catch (err) {
-          if (!res.headersSent) return sendJson(res, 502, { ok: false, error: err.message });
+          if (!res.headersSent) {
+            return sendJson(res, 502, { ok: false, error: err.name === 'AbortError' ? '源站响应超时' : err.message });
+          }
           try { res.end(); } catch (_) {}
           return;
+        } finally {
+          clearTimeout(timer);
         }
       }
 

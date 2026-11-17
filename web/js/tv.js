@@ -203,6 +203,23 @@ SP.tv = (() => {
       q(root, '#player-snapshot')?.addEventListener('click', () => this.snapshot());
       v.addEventListener('play', () => this.syncIcons());
       v.addEventListener('pause', () => this.syncIcons());
+      // 浏览器解码/加载失败时必须给反馈，否则界面永远停在「正在连接…」
+      v.addEventListener('error', () => {
+        if (!this.current) return;
+        const code = v.error ? v.error.code : 0;
+        const map = {
+          1: '播放被中止',
+          2: '网络错误，流地址无法访问',
+          3: '解码失败，当前格式浏览器播不了',
+          4: '这个地址不是浏览器能直接播放的格式',
+        };
+        this.showError(`${map[code] || '播放失败'}（错误码 ${code}）· 可点「强制转码重试」`);
+      });
+      v.addEventListener('stalled', () => {
+        if (!this.current) return;
+        const hint = q(document, '#player-hint');
+        if (hint && v.readyState < 3) hint.textContent = '网络卡住了，正在重连…';
+      });
       q(root, '#player-url-go')?.addEventListener('click', () => {
         const url = q(root, '#player-url')?.value.trim();
         if (!url) return toast('请填写播放地址', 'warn');
@@ -211,6 +228,12 @@ SP.tv = (() => {
       q(root, '#player-url')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') q(root, '#player-url-go')?.click(); });
       bind(root, '[data-pl-tab]', 'click', async (e, el) => {
         this.tab = el.dataset.plTab;
+        if (this.tab === 'channels' && !chState.loaded) {
+          document.querySelectorAll('[data-pl-tab]').forEach((b) => b.classList.toggle('active', b.dataset.plTab === this.tab));
+          const box = document.querySelector('#pl-items');
+          if (box) box.innerHTML = `<div class="empty-state" style="padding:26px 12px">${icon('refresh')}<b>正在加载频道…</b></div>`;
+          try { await loadChannels({ offset: 0 }); } catch (err) { toast(err.message, 'error'); }
+        }
         renderPlaylist();
       });
       bind(root, '[data-pl-play]', 'click', (e, el) => {
@@ -221,6 +244,11 @@ SP.tv = (() => {
 
       renderPlaylist();
       this.syncIcons();
+
+      // 直接进播放器页时频道列表还没拉过，这里补一次
+      if (this.tab === 'channels' && !chState.loaded) {
+        loadChannels({ offset: 0 }).then(() => renderPlaylist()).catch(() => {});
+      }
 
       // 如果从电视源页点了播放，进入本页后自动续播
       if (SP.pendingPlay) {
@@ -265,8 +293,10 @@ SP.tv = (() => {
       const v = this.video;
       this.destroyPlayers();
       const u = res.playUrl || '';
-      const isHls = /m3u8/i.test(u);
-      const isFlv = /\.flv/i.test(u);
+      // 以服务端探测出的真实类型为准：无扩展名的 IPTV 地址光看 URL 判断不了
+      const kind = res.kind || (/\.m3u8/i.test(u) ? 'hls' : /\.flv/i.test(u) ? 'flv' : 'file');
+      const isHls = kind === 'hls';
+      const isFlv = kind === 'flv';
       const onErr = (msg) => this.showError(msg);
       if (isHls) {
         if (window.Hls && window.Hls.isSupported()) {
@@ -278,11 +308,18 @@ SP.tv = (() => {
             manifestLoadingMaxRetry: 2,
           });
           this.hls = hls;
+          let retried = 0;
           hls.on(window.Hls.Events.ERROR, (_e, data) => {
             if (!data.fatal) return;
-            if (data.type === 'networkError') { hls.startLoad(); return; }
-            if (data.type === 'mediaError') { hls.recoverMediaError(); return; }
-            onErr(`HLS 播放错误：${data.details || ''}`);
+            if (retried < 2) {
+              retried += 1;
+              if (data.type === 'networkError') { setTimeout(() => hls.startLoad(), 800); return; }
+              if (data.type === 'mediaError') { hls.recoverMediaError(); return; }
+            }
+            const detail = data.details || data.type || '';
+            onErr(/manifest|levelLoad|fragLoad/i.test(detail)
+              ? `拉不到播放列表或分片（${detail}），该源可能已失效`
+              : `HLS 播放错误：${detail}`);
           });
           hls.loadSource(u);
           hls.attachMedia(v);

@@ -489,10 +489,21 @@
             if (!p.current) break;
             const hint = document.getElementById('player-hint');
             if (hint) hint.textContent = '正在转码…';
-            const res = await api.play({ url: p.current.url, mode: 'transcode', headers: p.current.headers || '', referer: p.current.referer || '' });
-            document.getElementById('player-empty').style.display = 'none';
-            p.session = res;
-            p.attach(res);
+            try {
+              const res = await api.play({
+                url: p.current.url,
+                channelId: p.current.id,
+                mode: 'transcode',
+                headers: p.current.headers || '',
+                referer: p.current.referer || '',
+              });
+              const empty = document.getElementById('player-empty');
+              if (empty) empty.style.display = 'none';
+              p.session = res;
+              p.attach(res);
+            } catch (err) {
+              p.showError(`转码也失败了：${err.message}`);
+            }
             break;
           }
           case 'player-network': openPlayerAdv(); break;
