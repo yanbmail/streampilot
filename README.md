@@ -1,5 +1,7 @@
 # StreamPilot · 跨平台推流控制台
 
+仓库地址：**https://github.com/yanbmail/streampilot**
+
 把「本地/屏幕/摄像头/网络流/电视源」统一变成可精确控参数的直播推流。
 一套代码同时提供 **桌面应用**（Electron 窗口）和 **浏览器控制台**（局域网内手机、其他电脑可打开切流）。
 
@@ -85,6 +87,7 @@ sudo apt install ffmpeg
 ### 安装与运行
 
 ```bash
+git clone https://github.com/yanbmail/streampilot.git
 cd streampilot
 npm install
 
@@ -96,6 +99,15 @@ npm run serve
 ```
 
 首次启动会自动创建数据目录 `~/.streampilot`（配置、快照、HLS 片段都在这里）。
+
+### 更新代码与同步版本
+
+```bash
+./scripts/sync.sh "这次改了什么"   # 提交并推送到 GitHub
+./scripts/publish.sh              # 只推送，不改动提交
+```
+
+详见 `docs/PUBLISH.md`。
 
 ### 桌面端与浏览器端
 
@@ -169,8 +181,11 @@ streampilot/
 │   ├── css/app.css
 │   ├── js/{app,views,job-form,tv,api,util}.js
 │   └── vendor/           hls.js、mpegts.js
-├── scripts/launch.js     启动器（清理 ELECTRON_RUN_AS_NODE 等环境干扰）
-└── docs/
+├── scripts/
+│   ├── launch.js         启动器（清理 ELECTRON_RUN_AS_NODE 等环境干扰）
+│   ├── publish.sh        推送仓库（默认推到 GitHub）
+│   └── sync.sh           一键提交 + 推送
+└── docs/                 发布与维护说明
 ```
 
 数据目录 `~/.streampilot`：

@@ -3,9 +3,17 @@
   "productName": "StreamPilot",
   "version": "1.0.0",
   "description": "跨平台推流控制台：多协议推流、屏幕区域采集、IPTV 电视源聚合与转推",
-  "author": "StreamPilot",
+  "author": "yanbmail",
   "license": "MIT",
   "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yanbmail/streampilot.git"
+  },
+  "homepage": "https://github.com/yanbmail/streampilot#readme",
+  "bugs": {
+    "url": "https://github.com/yanbmail/streampilot/issues"
+  },
   "main": "electron/main.js",
   "type": "commonjs",
   "scripts": {
