@@ -42,7 +42,10 @@
       "web/**/*",
       "node_modules/hls.js/dist/hls.min.js",
       "node_modules/mpegts.js/dist/mpegts.js",
-      "package.json"
+      "package.json",
+      "node_modules/**/*",
+      "!node_modules/electron/**",
+      "!node_modules/.cache/**"
     ],
     "directories": {
       "output": "release"
