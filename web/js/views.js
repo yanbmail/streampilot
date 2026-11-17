@@ -231,8 +231,8 @@ SP.views = (() => {
       <div class="table-wrap">
         <table class="tbl">
           <thead><tr>
-            <th style="width:26%">任务</th><th>输入源</th><th>推流目标</th><th>状态</th>
-            <th class="num">码率</th><th class="num">帧率</th><th class="num">已推</th><th style="width:150px"></th>
+            <th style="width:26%">任务</th><th class="col-optional">输入源</th><th class="col-optional">推流目标</th><th>状态</th>
+            <th class="num">码率</th><th class="num col-optional">帧率</th><th class="num">已推</th><th class="col-actions" style="width:150px"></th>
           </tr></thead>
           <tbody id="job-rows">${jobs.map(jobRow).join('') || `<tr><td colspan="8"><div class="empty-state">${icon('cast')}<b>暂无任务</b><p>点击右上角「新建推流」开始</p></div></td></tr>`}</tbody>
         </table>
@@ -244,13 +244,13 @@ SP.views = (() => {
       return `<tr data-job-row="${job.id}" data-search="${attr(`${job.name} ${job.source.url || ''} ${job.target.host || ''} ${job.target.filePath || ''}`.toLowerCase())}">
         <td class="cell-name"><div style="font-weight:550">${h(job.name)}</div>
           <div class="small dim mono">${h(job.id)}</div></td>
-        <td class="small muted cell-trunc">${h(sourceLabel(job))}</td>
-        <td class="small muted cell-trunc">${h(targetLabel(job))}</td>
+        <td class="small muted cell-trunc col-optional">${h(sourceLabel(job))}</td>
+        <td class="small muted cell-trunc col-optional">${h(targetLabel(job))}</td>
         <td>${statusPill(r.status)}</td>
         <td class="num">${r.bitrateKbps ? fmtKbps(r.bitrateKbps) : '—'}</td>
-        <td class="num">${r.fps ? Math.round(r.fps) : '—'}</td>
+        <td class="num col-optional">${r.fps ? Math.round(r.fps) : '—'}</td>
         <td class="num">${r.uptimeSec ? fmtDuration(r.uptimeSec) : '—'}</td>
-        <td><div class="row-actions">
+        <td class="cell-actions"><div class="row-actions">
           ${running
             ? `<button class="icon-btn" title="停止" data-act="job-stop" data-id="${job.id}">${icon('stop', 14)}</button>
                <button class="icon-btn" title="重启" data-act="job-restart" data-id="${job.id}">${icon('refresh', 14)}</button>`
