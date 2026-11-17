@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { execFileP, ensureDir, parseSize, urlKind, clamp } = require('./util');
+const { buildTargetUrl } = require('./config');
 
 const IS_MAC = process.platform === 'darwin';
 const IS_WIN = process.platform === 'win32';
@@ -275,11 +276,15 @@ class FFmpegService {
           }
           // 限制探测窗口，避免多码率主清单把每个分支都探一遍（起播慢）
           input.push('-probesize', '5000000', '-analyzeduration', '5000000');
-        } else if (['http', 'flv', 'rtmp', 'rtmps'].includes(kind)) {
+        } else if (['http', 'flv'].includes(kind)) {
           if (adv.inputReconnect) {
             input.push('-reconnect', '1', '-reconnect_streamed', '1',
               '-reconnect_delay_max', '8', '-reconnect_at_eof', '1');
           }
+        }
+        // rtmp/rtmps 由 librtmp 自行处理断线，不接受 -reconnect 系列参数（会直接报 Option not found）
+        if (kind === 'rtmp' || kind === 'rtmps') {
+          input.push('-rtmp_live', 'live');
         }
         if (kind !== 'udp' && kind !== 'srt') input.push('-rw_timeout', '15000000');
         if (adv.copyTimestamps) input.push('-copyts');
@@ -387,6 +392,17 @@ class FFmpegService {
     // 输出容器
     const tgt = ctx.target;
     args.push('-max_muxing_queue_size', '1024');
+
+    // 多路分发 / 同步录制：用 tee 复用同一份编码，避免重复转码
+    const fanout = this.buildFanout(job, ctx);
+    if (fanout) {
+      // tee 无法回写文件头，必须内联 extradata，否则 mkv/mp4 会报 Invalid data
+      args.push('-flags', '+global_header');
+      if (adv.extraOutputArgs) args.push(...String(adv.extraOutputArgs).split(/\s+/).filter(Boolean));
+      args.push('-f', 'tee', fanout);
+      return args;
+    }
+
     if (tgt.muxer === 'flv') {
       args.push('-f', 'flv', ...(tgt.extra || []));
     } else if (tgt.muxer === 'rtsp') {
@@ -394,10 +410,7 @@ class FFmpegService {
     } else if (tgt.muxer === 'mpegts') {
       args.push('-f', 'mpegts', '-mpegts_flags', '+resend_headers');
     } else if (tgt.muxer === 'hls') {
-      const dir = ensureDir(path.join(ctx.hlsRoot, job.id));
-      for (const f of fs.readdirSync(dir)) {
-        if (/\.(ts|m4s|mp4|m3u8|tmp)$/.test(f)) { try { fs.unlinkSync(path.join(dir, f)); } catch (_) {} }
-      }
+      const dir = this.prepareHlsDir(job, ctx);
       args.push('-f', 'hls',
         '-hls_time', String(t.hlsSegmentSeconds || 2),
         '-hls_list_size', String(t.hlsListSize || 6),
@@ -406,7 +419,6 @@ class FFmpegService {
         '-hls_segment_filename', path.join(dir, 'seg_%06d.ts'));
       if (adv.extraOutputArgs) args.push(...String(adv.extraOutputArgs).split(/\s+/).filter(Boolean));
       args.push(path.join(dir, 'index.m3u8'));
-      // HLS 目标已在上面写入清单路径，不再追加 URL
       return args;
     } else if (!tgt.muxer) {
       // 录制文件：按扩展名推断容器，未识别时退回 matroska
@@ -422,6 +434,84 @@ class FFmpegService {
     if (adv.extraOutputArgs) args.push(...String(adv.extraOutputArgs).split(/\s+/).filter(Boolean));
     args.push(tgt.url || '-');
     return args;
+  }
+
+  /** 清空并返回本任务的 HLS 输出目录 */
+  prepareHlsDir(job, ctx) {
+    const dir = ensureDir(path.join(ctx.hlsRoot, job.id));
+    for (const f of fs.readdirSync(dir)) {
+      if (/\.(ts|m4s|mp4|m3u8|tmp)$/.test(f)) { try { fs.unlinkSync(path.join(dir, f)); } catch (_) {} }
+    }
+    return dir;
+  }
+
+  /** 单个目标 → tee 的 slave 片段：[格式:选项]地址 */
+  slaveSpec(spec, { ignore = false, hlsTime = 2, hlsList = 6 } = {}) {
+    const opts = [];
+    const muxer = spec.muxer || 'matroska';
+    opts.push(`f=${muxer}`);
+    if (ignore) opts.push('onfail=ignore');
+
+    if (muxer === 'flv') {
+      opts.push('flvflags=no_duration_filesize');
+    } else if (muxer === 'mpegts') {
+      opts.push('mpegts_flags=+resend_headers');
+    } else if (muxer === 'rtsp') {
+      opts.push('rtsp_transport=tcp', 'muxdelay=0.1');
+    } else if (muxer === 'mp4' || muxer === 'mov') {
+      opts.push('movflags=+faststart');
+    } else if (muxer === 'hls') {
+      opts.push(`hls_time=${hlsTime}`, `hls_list_size=${hlsList}`,
+        'hls_flags=delete_segments+append_list+omit_endlist');
+    }
+    return `[${opts.join(':')}]${spec.url}`;
+  }
+
+  /**
+   * 多路分发 + 同步录制。
+   * 返回 tee 目标串；没有附加目标也没开录制时返回空。
+   * 用 tee 的好处：只编码一次，N 个平台共用一份码流，CPU 占用与单路接近。
+   */
+  buildFanout(job, ctx) {
+    const extras = (job.targets || []);
+    const rec = job.record || {};
+    const doRecord = Boolean(rec.enabled && rec.filePath);
+    if (!extras.length && !doRecord) return null;
+
+    const main = ctx.target;
+    // HTTP-FLV 监听靠 -listen 协议参数，tee 无法承载，退回单路
+    if (main.listen) {
+      ctx.warn('HTTP-FLV 监听模式不支持多路分发/同步录制，已按单路输出');
+      return null;
+    }
+
+    const t = job.target;
+    const slaves = [];
+    if (main.muxer === 'hls') {
+      const dir = this.prepareHlsDir(job, ctx);
+      slaves.push(this.slaveSpec(
+        { muxer: 'hls', url: path.join(dir, 'index.m3u8') },
+        { hlsTime: t.hlsSegmentSeconds || 2, hlsList: t.hlsListSize || 6 },
+      ));
+    } else {
+      slaves.push(this.slaveSpec({ muxer: main.muxer, url: main.url || '-' }));
+    }
+
+    for (const extra of extras) {
+      const spec = buildTargetUrl(extra);
+      if (!spec.url) continue;
+      if (spec.listen) continue;
+      slaves.push(this.slaveSpec({ muxer: spec.muxer, url: spec.url }, { ignore: true }));
+    }
+
+    if (doRecord) {
+      ensureDir(path.dirname(rec.filePath));
+      const fmt = rec.recordFormat === 'ts' ? 'mpegts' : rec.recordFormat === 'mkv' ? 'matroska' : 'mp4';
+      slaves.push(this.slaveSpec({ muxer: fmt, url: rec.filePath }, { ignore: true }));
+    }
+
+    if (slaves.length < 2) return null;
+    return slaves.join('|');
   }
 
   /** 完整推流命令 */

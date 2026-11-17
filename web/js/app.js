@@ -12,6 +12,7 @@
     runtime: {}, system: { ffmpeg: { encoders: [], protocols: [] }, addresses: [] },
     iptv: { total: 0, groups: [], catalogs: [], recommended: [] },
     backups: [], template: {},
+    rtmp: { available: true, running: false, port: 1935, httpPort: 8399, streams: [] },
   };
   SP.logBuffer = [];
   SP.series = new Map();
@@ -38,6 +39,7 @@
     SP.state.iptv = s.iptv;
     SP.state.backups = s.backups || [];
     SP.state.template = s.template || {};
+    SP.state.rtmp = s.rtmp || SP.state.rtmp;
     for (const [jobId, r] of Object.entries(s.runtime || {})) {
       if (typeof r.bitrateKbps === 'number' && r.status === 'running') pushSeries(jobId, r.bitrateKbps);
     }
@@ -261,6 +263,46 @@
           case 'open-dir': {
             const r = await api.openFolder(SP.state.system.dataDir);
             if (!r.ok) toast(r.error || '无法打开目录', 'warn');
+            break;
+          }
+
+          /* ---------- 内置 RTMP 收流 ---------- */
+          case 'rtmp-start': {
+            const port = Number(document.querySelector('#rtmp-port')?.value || 1935);
+            const httpPort = Number(document.querySelector('#rtmp-http-port')?.value || 8399);
+            toast('正在启动收流服务…', 'info', 1500);
+            const r = await api.post('/api/rtmp/start', { port, httpPort }).catch((e) => ({ ok: false, error: e.message }));
+            if (r.ok) toast('收流服务已启动，可以开始推流了', 'ok');
+            else toast(`启动失败：${r.error}`, 'error', 7000);
+            await SP.refreshState({ silent: true });
+            break;
+          }
+          case 'rtmp-stop': {
+            const ok = await confirmDlg({ title: '停止收流服务', message: '正在推上来的流会中断，确定停止？', confirmText: '停止', danger: true });
+            if (!ok) break;
+            await api.post('/api/rtmp/stop', {});
+            toast('收流服务已停止', 'ok');
+            await SP.refreshState({ silent: true });
+            break;
+          }
+          case 'rtmp-play': {
+            SP.pendingPlay = { name: `收流 · ${el.dataset.name || ''}`, url: el.dataset.url };
+            location.hash = '#/player';
+            break;
+          }
+          case 'rtmp-push': {
+            const stream = el.dataset.stream;
+            const r = await api.post('/api/rtmp/push', {
+              stream,
+              name: `收流转推 · ${stream}`,
+              target: { protocol: 'hls', hlsSegmentSeconds: 2, hlsListSize: 6 },
+              video: { mode: 'transcode', encoder: 'libx264', preset: 'veryfast', width: 1280, height: 720, fps: 30, rateControl: 'cbr', bitrateKbps: 3000 },
+              audio: { mode: 'transcode', bitrateKbps: 128 },
+            }).catch((e) => ({ ok: false, error: e.message }));
+            if (!r.ok) return toast(`创建失败：${r.error}`, 'error');
+            toast('已创建转推任务，可在推流页改成要推的平台', 'ok', 5000);
+            await SP.refreshState({ silent: true });
+            location.hash = '#/streams';
             break;
           }
 
@@ -569,6 +611,9 @@
         if (data.status === 'start') toast('正在拉取电视源…', 'info', 1600);
         if (data.status === 'done') toast(`源更新完成，新增 ${data.count} 个频道`, 'ok', 2200);
         if (data.status === 'error') toast(`源更新失败：${data.error}`, 'error', 5000);
+      } else if (event === 'rtmp') {
+        SP.state.rtmp = { ...(SP.state.rtmp || {}), ...data };
+        if (SP.page === 'settings') SP.render({ keepScroll: true });
       } else if (event === 'iptv') {
         SP.state.iptv = { ...SP.state.iptv, ...data };
         updateShellBadges();

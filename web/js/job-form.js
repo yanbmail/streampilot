@@ -244,6 +244,22 @@ SP.jobForm = (() => {
           renderTab();
         }
       }
+      if (action === 'add-extra') {
+        draft.targets = Array.isArray(draft.targets) ? draft.targets : [];
+        if (draft.targets.length >= 8) return toast('最多 8 个附加目标', 'warn');
+        draft.targets.push({ protocol: 'rtmp', host: '', port: 0, app: 'live', streamKey: '', url: '', name: '', srtLatency: 200, udpTTL: 1 });
+        renderTab();
+      }
+      if (action === 'rm-extra') {
+        draft.targets.splice(Number(ds.idx), 1);
+        renderTab();
+      }
+      if (action === 'pick-record') {
+        const def = draft.record.filePath || `streampilot-${Date.now()}.${draft.record.recordFormat || 'mp4'}`;
+        const r = await api.pickSave(def);
+        if (r.ok && r.file) { draft.record.filePath = r.file; renderTab(); }
+        else if (!r.ok) toast(r.error, 'warn');
+      }
       if (action === 'pick-save') {
         const r = await api.pickSave(draft.target.filePath || `record-${Date.now()}.mp4`);
         if (r.ok && r.file) { draft.target.filePath = r.file; renderTab(); }
@@ -609,6 +625,99 @@ SP.jobForm = (() => {
       <div class="field" style="margin-top:16px">
         <label>最终推流地址</label>
         <div class="cmd-box" style="max-height:none">${h(targetPreview())}</div>
+      </div>
+      ${extraTargetsBlock()}
+      ${recordBlock()}`;
+  }
+
+  /** 多平台分发：一份编码同时推多路 */
+  function extraTargetsBlock() {
+    const list = Array.isArray(draft.targets) ? draft.targets : [];
+    const rows = list.map((x, i) => {
+      const proto = x.protocol || 'rtmp';
+      const needPath = ['rtmp', 'rtmps', 'rtsp'].includes(proto);
+      return `
+      <div class="fan-row">
+        <div class="fan-top">
+          <span class="fan-idx">${i + 1}</span>
+          <input class="input fan-name" data-k="targets.${i}.name" value="${attr(x.name)}" placeholder="备注，例如「抖音」" />
+          <button type="button" class="btn btn-sm btn-ghost" data-local="rm-extra" data-idx="${i}" title="移除">${icon('trash', 13)}</button>
+        </div>
+        <div class="form-grid cols-3">
+          <div class="field">
+            <label>协议</label>
+            <select class="input" data-k="targets.${i}.protocol" data-rerender="1">
+              ${PROTOCOLS.filter((p) => !['hls', 'file', 'flv'].includes(p.v)).map((p) => `<option value="${p.v}" ${p.v === proto ? 'selected' : ''}>${h(p.l)}</option>`).join('')}
+            </select>
+          </div>
+          <div class="field span-2">
+            <label>服务器地址</label>
+            <input class="input" data-k="targets.${i}.host" value="${attr(x.host)}" placeholder="${proto === 'udp' ? '239.0.0.1' : 'live.example.com'}" />
+          </div>
+          <div class="field">
+            <label>端口</label>
+            <input class="input" data-k="targets.${i}.port" data-type="num" type="number" value="${x.port || ''}" placeholder="${proto === 'rtmp' ? '1935' : proto === 'rtsp' ? '8554' : proto === 'srt' ? '9000' : '1234'}" />
+          </div>
+          ${needPath ? `
+          <div class="field">
+            <label>应用名</label>
+            <input class="input" data-k="targets.${i}.app" value="${attr(x.app)}" placeholder="live" />
+          </div>
+          <div class="field">
+            <label>推流码</label>
+            <input class="input" data-k="targets.${i}.streamKey" value="${attr(x.streamKey)}" placeholder="stream-key" style="font-family:var(--mono);font-size:12px" />
+          </div>` : `
+          <div class="field span-2">
+            <label>流名称</label>
+            <input class="input" data-k="targets.${i}.streamKey" value="${attr(x.streamKey)}" placeholder="stream" />
+          </div>`}
+          <div class="field span-3">
+            <label>完整地址（可选）</label>
+            <input class="input" data-k="targets.${i}.url" value="${attr(x.url)}" placeholder="填了这里就忽略上面的字段" style="font-family:var(--mono);font-size:12px" />
+          </div>
+        </div>
+      </div>`;
+    }).join('');
+
+    return `
+      <div class="section-title" style="margin:22px 0 10px">
+        <h2>多平台分发</h2><div class="line"></div>
+        <button class="btn btn-sm" data-local="add-extra">${icon('plus', 12)} 添加目标</button>
+      </div>
+      <div class="hint-box" style="margin-bottom:10px">${icon('info')}<div>同一份编码同时推到多个平台，不额外占用 CPU；某一路挂了会自动跳过，不影响其他路。</div></div>
+      <div class="fan-list">${rows || '<div class="empty-inline">还没有附加目标</div>'}</div>`;
+  }
+
+  /** 推流同时录制一份到本地 */
+  function recordBlock() {
+    const rec = draft.record || {};
+    const on = Boolean(rec.enabled);
+    return `
+      <div class="section-title" style="margin:22px 0 10px"><h2>同步录制</h2><div class="line"></div></div>
+      <div class="form-grid">
+        <div class="field span-3">
+          <label class="switch">
+            <input type="checkbox" data-k="record.enabled" data-rerender="1" ${on ? 'checked' : ''} />
+            <span class="track"></span><span class="lbl">推流的同时录一份到本地磁盘</span>
+          </label>
+          <div class="help">与推流共用同一份编码，不重复占用 CPU；断流重连后会自动续写同一个文件</div>
+        </div>
+        ${on ? `
+        <div class="field span-2">
+          <label>保存路径</label>
+          <div class="input-group">
+            <input class="input" data-k="record.filePath" value="${attr(rec.filePath)}" placeholder="留空自动存到 ~/.streampilot/records" style="font-family:var(--mono);font-size:12px" />
+            <button type="button" class="btn" data-local="pick-record">${icon('folder', 14)} 选择</button>
+          </div>
+          <div class="help">扩展名决定封装格式：mp4 / mkv / ts</div>
+        </div>
+        <div class="field">
+          <label>封装格式</label>
+          <select class="input" data-k="record.recordFormat">
+            ${[{ v: 'mp4', l: 'MP4（通用，便于剪辑）' }, { v: 'mkv', l: 'MKV（中断可恢复）' }, { v: 'ts', l: 'TS（最抗异常）' }]
+    .map((o) => `<option value="${o.v}" ${o.v === (rec.recordFormat || 'mp4') ? 'selected' : ''}>${h(o.l)}</option>`).join('')}
+          </select>
+        </div>` : ''}
       </div>`;
   }
 

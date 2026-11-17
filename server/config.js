@@ -85,6 +85,14 @@ function jobDefaults() {
       copyTimestamps: false,
       realtime: true,
     },
+    // 一份编码同时分发到多个目标（除主目标外）
+    targets: [],
+    // 推流同时录制一份到本地磁盘
+    record: {
+      enabled: false,
+      filePath: '',
+      recordFormat: 'mp4', // mp4 | ts | mkv
+    },
   };
 }
 
@@ -107,6 +115,15 @@ function defaultConfig() {
       preview: { maxHeight: 1080, mode: 'auto', idleTimeoutSec: 40 },
       iptv: { autoRefreshHours: 12, concurrency: 10 },
       backup: { enabled: true, intervalMin: 30, keep: 40 },
+      // 内置 RTMP 收流服务端：不装 nginx 也能接收 OBS / 手机 / 其他设备推上来的流
+      rtmpServer: {
+        enabled: false,
+        port: 1935,
+        httpPort: 8399,
+        chunkSize: 60000,
+        gopCache: true,
+        autoStart: false,
+      },
       ui: { page: 'dashboard', theme: 'dark' },
       defaults: {
         video: jobDefaults().video,
@@ -199,6 +216,39 @@ function normalizeJob(input = {}, prev = null) {
   adv.reconnectDelaySec = clamp(adv.reconnectDelaySec, 1, 120, 3);
   adv.maxReconnect = clamp(adv.maxReconnect, 0, 9999, 0);
   adv.threadQueue = clamp(adv.threadQueue, 32, 8192, 512);
+
+  // 附加分发目标（一份编码推多路）
+  const rawTargets = Array.isArray(merged.targets) ? merged.targets : [];
+  merged.targets = rawTargets.slice(0, 8).map((x) => {
+    const o = {
+      protocol: PROTOCOLS.includes(x.protocol) ? x.protocol : 'rtmp',
+      host: String(x.host || ''),
+      port: clamp(x.port, 0, 65535, 0),
+      app: String(x.app || 'live').replace(/^\/+|\/+$/g, ''),
+      streamKey: String(x.streamKey || ''),
+      url: String(x.url || '').trim(),
+      name: String(x.name || '').slice(0, 60),
+      srtLatency: clamp(x.srtLatency, 20, 8000, 200),
+      srtPassphrase: String(x.srtPassphrase || ''),
+      udpTTL: clamp(x.udpTTL, 0, 255, 1),
+    };
+    // 空行（没填任何地址）直接丢弃，避免生成无效 slave
+    const empty = !o.url && !o.host && !o.streamKey;
+    return empty ? null : o;
+  }).filter(Boolean);
+
+  const rec = merged.record || {};
+  rec.enabled = Boolean(rec.enabled);
+  rec.filePath = String(rec.filePath || '');
+  rec.recordFormat = ['mp4', 'ts', 'mkv'].includes(rec.recordFormat) ? rec.recordFormat : 'mp4';
+  merged.record = rec;
+
+  // 录制文件扩展名与容器保持一致
+  if (rec.enabled && rec.filePath) {
+    const ext = path.extname(rec.filePath).toLowerCase().replace('.', '');
+    if (['mp4', 'ts', 'mkv', 'flv', 'mov'].includes(ext)) rec.recordFormat = ext === 'mov' ? 'mp4' : ext;
+  }
+
   return merged;
 }
 

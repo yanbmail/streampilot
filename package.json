@@ -1,7 +1,7 @@
 {
   "name": "streampilot",
   "productName": "StreamPilot",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "跨平台推流控制台：多协议推流、屏幕区域采集、IPTV 电视源聚合与转推",
   "author": "yanbmail",
   "license": "MIT",
@@ -27,7 +27,8 @@
   },
   "dependencies": {
     "hls.js": "^1.5.17",
-    "mpegts.js": "^1.8.0"
+    "mpegts.js": "^1.8.0",
+    "node-media-server": "^4.4.6"
   },
   "devDependencies": {
     "electron": "^33.2.0"
@@ -48,7 +49,10 @@
     },
     "mac": {
       "category": "public.app-category.video",
-      "target": ["dmg", "zip"],
+      "target": [
+        "dmg",
+        "zip"
+      ],
       "extendInfo": {
         "NSCameraUsageDescription": "用于将摄像头画面作为推流源",
         "NSMicrophoneUsageDescription": "用于采集麦克风声音",
@@ -56,10 +60,16 @@
       }
     },
     "win": {
-      "target": ["nsis", "portable"]
+      "target": [
+        "nsis",
+        "portable"
+      ]
     },
     "linux": {
-      "target": ["AppImage", "deb"],
+      "target": [
+        "AppImage",
+        "deb"
+      ],
       "category": "AudioVideo"
     }
   }

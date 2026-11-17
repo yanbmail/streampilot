@@ -8,6 +8,7 @@
 | Electron | 桌面窗口 | MIT |
 | hls.js | 浏览器端 HLS 播放（`web/vendor/hls.min.js`） | Apache-2.0 |
 | mpegts.js | 浏览器端 HTTP-FLV 播放（`web/vendor/mpegts.js`） | Apache-2.0 |
+| node-media-server | 内置 RTMP 收流服务端（纯 JS 实现） | MIT |
 
 ## 电视源数据
 

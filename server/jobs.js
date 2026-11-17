@@ -36,6 +36,7 @@ class JobManager extends EventEmitter {
     this.dataDir = dataDir;
     this.hlsRoot = hlsRoot;
     this.tmpDir = ensureDir(path.join(dataDir, 'tmp'));
+    this.recordsRoot = ensureDir(path.join(dataDir, 'records'));
     this.running = new Map();
     this.history = new Map(); // jobId -> {totalBytes, restarts}
     this.logStore = new Map(); // jobId -> 日志（进程退出后仍保留，便于排错）
@@ -72,6 +73,12 @@ class JobManager extends EventEmitter {
     } else if (t.protocol === 'file' && t.filePath) {
       probe = () => {
         try { return { bytes: fs.statSync(t.filePath).size }; } catch (_) { return { bytes: 0 }; }
+      };
+    } else if (job.record && job.record.enabled && job.record.filePath) {
+      // 多路分发（tee）时 ffmpeg 不报总字节数，用同步录制的文件体积推算实际码流
+      const recPath = job.record.filePath;
+      probe = () => {
+        try { return { bytes: fs.statSync(recPath).size }; } catch (_) { return { bytes: 0 }; }
       };
     }
     if (!probe) return;
@@ -144,6 +151,8 @@ class JobManager extends EventEmitter {
       command: rt.command,
       startedAt: rt.startedAt,
       health: rt.health,
+      recordPath: (this.store.getJob(jobId)?.record || {}).enabled
+        ? (this.store.getJob(jobId)?.record || {}).filePath : '',
     };
   }
 
@@ -173,6 +182,24 @@ class JobManager extends EventEmitter {
       if (missing.length) throw new Error(`媒体文件不存在：${missing[0]}`);
     }
     if (job.source.type === 'url' && !job.source.url) throw new Error('请填写输入流地址');
+
+    // 附加分发目标校验
+    const extras = job.targets || [];
+    extras.forEach((e, i) => {
+      if (e.url) return;
+      if (!e.host) throw new Error(`第 ${i + 1} 个附加目标缺少服务器地址`);
+      if (!e.streamKey) throw new Error(`第 ${i + 1} 个附加目标缺少推流码 / 流名称`);
+    });
+
+    // 同步录制：没填路径就自动落到数据目录
+    const rec = job.record || {};
+    if (rec.enabled) {
+      if (!rec.filePath) {
+        const ext = rec.recordFormat || 'mp4';
+        rec.filePath = path.join(this.recordsRoot, `${job.id}_${Date.now()}.${ext}`);
+      }
+      ensureDir(path.dirname(rec.filePath));
+    }
 
     let concatFile = '';
     if (job.source.type === 'files') {
@@ -237,7 +264,15 @@ class JobManager extends EventEmitter {
     this.running.set(jobId, rt);
     this.startOutputMeter(job, rt);
     warnings.forEach((w) => this.log(jobId, `提示：${w}`, 'warn'));
-    this.log(jobId, `启动推流 → ${prep.target.url || '(本地 HLS)'}`);
+    const extraCount = (job.targets || []).filter((x) => x.url || x.host).length;
+    const recOn = Boolean(job.record && job.record.enabled && job.record.filePath);
+    const fanCount = extraCount + (recOn ? 1 : 0);
+    this.log(jobId, `启动推流 → ${prep.target.url || '(本地 HLS)'}${fanCount ? `（同一份编码分发 ${fanCount + 1} 路）` : ''}`);
+    if (recOn) this.log(jobId, `同步录制 → ${job.record.filePath}`, 'ok');
+    if (extraCount) {
+      this.log(jobId, `附加目标：${(job.targets || []).filter((x) => x.url || x.host)
+        .map((x) => `${x.protocol}://${x.host || '-'}/${[x.app, x.streamKey].filter(Boolean).join('/')}`).join(' , ')}`);
+    }
     this.emit('state', { jobId, status: 'starting' });
 
     const proc = spawn(this.ffmpeg.bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });

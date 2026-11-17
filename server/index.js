@@ -10,6 +10,7 @@ const { FFmpegService } = require('./ffmpeg');
 const { JobManager } = require('./jobs');
 const { IPTVService } = require('./iptv');
 const { PreviewService, proxyHls, MIME } = require('./preview');
+const { RtmpServer } = require('./rtmp-server');
 const {
   ensureDir, defaultDataDir, uid, humanBytes, formatDuration, clamp, urlKind,
 } = require('./util');
@@ -81,6 +82,7 @@ async function createApp(options = {}) {
   const iptv = new IPTVService({ store, dataDir });
   iptv.load();
   const preview = new PreviewService({ ffmpeg, dataDir, store });
+  const rtmp = new RtmpServer();
 
   const sseClients = new Set();
   const globalLogs = [];
@@ -115,6 +117,15 @@ async function createApp(options = {}) {
   iptv.on('refresh', (p) => broadcast('iptv-refresh', p));
   iptv.on('changed', () => broadcast('iptv', iptv.stats()));
 
+  rtmp.on('publish', async (s) => {
+    globalLogs.push({ t: Date.now(), jobId: 'rtmp', level: 'ok', line: `收到推流：${s.app}/${s.name}` });
+    broadcast('rtmp', await rtmp.status());
+  });
+  rtmp.on('unpublish', async (s) => {
+    globalLogs.push({ t: Date.now(), jobId: 'rtmp', level: 'warn', line: `推流结束：${s.app}/${s.name}` });
+    broadcast('rtmp', await rtmp.status());
+  });
+
   // 系统信息
   const systemInfo = () => ({
     platform: process.platform,
@@ -139,6 +150,19 @@ async function createApp(options = {}) {
     memory: process.memoryUsage().rss,
   });
 
+  /** 收流服务状态（不含异步探测，供 /api/state 快速返回） */
+  const rtmpQuick = () => ({
+    available: RtmpServer.available(),
+    running: rtmp.running,
+    port: rtmp.config.port,
+    httpPort: rtmp.config.httpPort,
+    startedAt: rtmp.startedAt,
+    error: rtmp.lastError,
+    streams: [...rtmp.streams.entries()].map(([p, s]) => ({
+      path: p, app: s.app, name: s.name, startedAt: s.startedAt, clients: s.clients,
+    })),
+  });
+
   const statePayload = () => ({
     ok: true,
     config: store.config,
@@ -149,6 +173,7 @@ async function createApp(options = {}) {
       ...b, human: humanBytes(b.size),
     })),
     preview: preview.info(),
+    rtmp: rtmpQuick(),
     serverTime: Date.now(),
   });
 
@@ -192,6 +217,62 @@ async function createApp(options = {}) {
       if (pathname === '/api/state') return sendJson(res, 200, statePayload());
 
       if (pathname === '/api/system') return sendJson(res, 200, { ok: true, system: systemInfo() });
+
+      // ── 内置 RTMP 收流服务 ──────────────────────────────
+      if (pathname === '/api/rtmp' && req.method === 'GET') {
+        return sendJson(res, 200, { ok: true, rtmp: await rtmp.status() });
+      }
+
+      if (pathname === '/api/rtmp/start' && req.method === 'POST') {
+        const body = await readBody(req).catch(() => ({}));
+        const conf = store.config.settings.rtmpServer || {};
+        const opts = {
+          port: Number(body.port) || conf.port || 1935,
+          httpPort: Number(body.httpPort) || conf.httpPort || 8399,
+          chunkSize: conf.chunkSize,
+          gopCache: conf.gopCache,
+        };
+        try {
+          const st = await rtmp.start(opts);
+          store.config.settings.rtmpServer = { ...conf, ...opts, enabled: true };
+          store.touch('settings');
+          return sendJson(res, 200, { ok: true, rtmp: st });
+        } catch (err) {
+          store.config.settings.rtmpServer = { ...conf, enabled: false };
+          store.touch('settings');
+          return sendJson(res, 400, { ok: false, error: err.message, rtmp: await rtmp.status() });
+        }
+      }
+
+      if (pathname === '/api/rtmp/stop' && req.method === 'POST') {
+        rtmp.stop();
+        store.config.settings.rtmpServer = { ...(store.config.settings.rtmpServer || {}), enabled: false };
+        store.touch('settings');
+        return sendJson(res, 200, { ok: true, rtmp: await rtmp.status() });
+      }
+
+      // 把本机收到的某路流直接变成推流任务（转推）
+      if (pathname === '/api/rtmp/push' && req.method === 'POST') {
+        const body = await readBody(req);
+        const stream = String(body.stream || '').replace(/^\/+/, '');
+        if (!stream) return sendJson(res, 400, { ok: false, error: '请指定要转推的流名称' });
+        const sourceUrl = `rtmp://127.0.0.1:${rtmp.config.port}/live/${stream}`;
+        const job = normalizeJob({
+          name: body.name || `收流转推 · ${stream}`,
+          source: { type: 'url', url: sourceUrl },
+          target: body.target || jobDefaults().target,
+          targets: body.targets || [],
+          record: body.record || undefined,
+          video: body.video || undefined,
+          audio: body.audio || undefined,
+          autoStart: Boolean(body.autoStart),
+        });
+        store.upsertJob(job);
+        if (job.autoStart) {
+          jobs.start(job.id).catch((e) => jobs.log(job.id, `启动失败：${e.message}`, 'error'));
+        }
+        return sendJson(res, 200, { ok: true, job });
+      }
 
       if (pathname === '/api/system/redetect' && req.method === 'POST') {
         const r = await ffmpeg.resolve(store.config.settings);
@@ -575,7 +656,7 @@ async function createApp(options = {}) {
   server.keepAliveTimeout = 65000;
 
   return {
-    server, store, ffmpeg, jobs, iptv, preview, dataDir, systemInfo,
+    server, store, ffmpeg, jobs, iptv, preview, rtmp, dataDir, systemInfo,
     async listen(port = store.config.settings.http?.port || 8377, host) {
       const allowLan = Boolean(store.config.settings.http?.allowLan);
       const bindHost = host || (allowLan ? '0.0.0.0' : '127.0.0.1');
@@ -591,11 +672,18 @@ async function createApp(options = {}) {
       store.saveNow();
       jobs.autoStartAll().catch(() => {});
       iptv.autoRefreshIfStale().catch(() => {});
+      // 上次退出前开着的收流服务，这次启动自动恢复
+      const rc = store.config.settings.rtmpServer;
+      if (rc && rc.enabled) {
+        rtmp.start({ port: rc.port, httpPort: rc.httpPort, chunkSize: rc.chunkSize, gopCache: rc.gopCache })
+          .catch((err) => { rtmp.lastError = err.message; });
+      }
       return { port: actual, host: bindHost };
     },
     async close() {
       clearInterval(statsTimer);
       preview.stopAll();
+      try { rtmp.stop(); } catch (_) {}
       await jobs.stopAll();
       await new Promise((r) => server.close(r));
     },

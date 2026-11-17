@@ -241,8 +241,14 @@ SP.views = (() => {
     function jobRow(job) {
       const r = rt(job);
       const running = isRunning(r.status);
+      const fanCount = (job.targets || []).filter((x) => x.url || x.host).length;
+      const recOn = Boolean(job.record && job.record.enabled);
+      const tags = [
+        fanCount ? `<span class="tag-fan">+${fanCount} 路</span>` : '',
+        recOn ? '<span class="tag-rec">● 录制</span>' : '',
+      ].join('');
       return `<tr data-job-row="${job.id}" data-search="${attr(`${job.name} ${job.source.url || ''} ${job.target.host || ''} ${job.target.filePath || ''}`.toLowerCase())}">
-        <td class="cell-name"><div style="font-weight:550">${h(job.name)}</div>
+        <td class="cell-name"><div style="font-weight:550">${h(job.name)}${tags}</div>
           <div class="small dim mono">${h(job.id)}</div></td>
         <td class="small muted cell-trunc col-optional">${h(sourceLabel(job))}</td>
         <td class="small muted cell-trunc col-optional">${h(targetLabel(job))}</td>
@@ -342,6 +348,8 @@ SP.views = (() => {
     const S = SP.state;
     const st = S.config.settings;
     const ff = S.system.ffmpeg;
+    const rc = S.rtmp || { running: false, port: 1935, httpPort: 8399, streams: [] };
+    const lanIp = (S.system.addresses || [])[0]?.address || '127.0.0.1';
     const encoders = ['libx264', 'h264_videotoolbox', 'libx265', 'hevc_videotoolbox'].filter((e) => ff.encoders.includes(e));
     const html = `
       <div class="settings-grid">
@@ -415,6 +423,47 @@ SP.views = (() => {
             <div style="margin-top:10px">
               <div class="small dim" style="margin-bottom:6px">本机可用地址</div>
               ${(S.system.addresses || []).map((a) => `<div class="mono small" style="margin-bottom:3px">http://${h(a.address)}:${S.config.settings.http.port}${st.http?.lanToken ? `?token=${h(st.http.lanToken)}` : ''} <span class="dim">(${h(a.name)})</span></div>`).join('') || '<div class="dim small">未检测到局域网地址</div>'}
+            </div>
+          </div>
+        </div>
+
+        <div class="card span-full">
+          <div class="card-head"><h3>内置 RTMP 收流服务</h3><div class="spacer"></div>
+            <span class="pill ${rc.running ? 'ok' : 'info'}"><i class="dot"></i>${rc.running ? '运行中' : '已停止'}</span>
+          </div>
+          <div class="card-body">
+            <div class="hint-box">${icon('info')}<div>开启后本机就是推流接收端：OBS、手机推流 App、其他设备直接推到本机，收上来的流可以预览、转推、同时录制，不必再另装 nginx-rtmp / SRS。</div></div>
+            <div class="form-grid" style="margin-top:12px">
+              <div class="field"><label>RTMP 收流端口</label><input class="input" id="rtmp-port" type="number" value="${rc.port || 1935}" ${rc.running ? 'disabled' : ''} />
+                <div class="help">OBS「服务器」填 rtmp://本机IP:端口/live</div></div>
+              <div class="field"><label>HTTP-FLV 播放端口</label><input class="input" id="rtmp-http-port" type="number" value="${rc.httpPort || 8399}" ${rc.running ? 'disabled' : ''} />
+                <div class="help">浏览器可直接播放 http://IP:端口/live/流名.flv</div></div>
+              <div class="field" style="justify-content:flex-end;display:flex">
+                ${rc.running
+    ? `<button class="btn btn-danger" data-act="rtmp-stop">${icon('stop', 14)} 停止收流</button>`
+    : `<button class="btn btn-primary" data-act="rtmp-start">${icon('cast', 14)} 启动收流</button>`}
+              </div>
+            </div>
+            ${rc.running ? `
+            <div class="field" style="margin-top:6px">
+              <label>推流地址（OBS「服务器」+「串流密钥」）</label>
+              <div class="input-group">
+                <input class="input mono" readonly value="rtmp://${h(lanIp)}:${rc.port}/live/" />
+                <button class="btn" data-act="copy-text" data-text="rtmp://${attr(lanIp)}:${rc.port}/live/">复制</button>
+              </div>
+              <div class="help">串流密钥自己定，例如 <code>myphone</code>，推上来后下面会出现这一路流</div>
+            </div>` : ''}
+            <div style="margin-top:14px">
+              <div class="small dim" style="margin-bottom:6px">当前收到的流</div>
+              ${(rc.streams || []).length ? (rc.streams || []).map((s) => `
+                <div class="ingest-item">
+                  <span class="nm mono">${h(s.app)}/${h(s.name)}</span>
+                  <span class="dim small">${Math.floor((Date.now() - s.startedAt) / 1000)}s</span>
+                  <div class="spacer"></div>
+                  <button class="btn btn-sm" data-act="copy-text" data-text="http://${attr(lanIp)}:${rc.httpPort}/live/${attr(s.name)}.flv">复制播放地址</button>
+                  <button class="btn btn-sm" data-act="rtmp-play" data-url="http://${attr(lanIp)}:${rc.httpPort}/live/${attr(s.name)}.flv" data-name="${attr(s.name)}">${icon('play', 12)} 预览</button>
+                  <button class="btn btn-sm btn-primary" data-act="rtmp-push" data-stream="${attr(s.name)}">${icon('cast', 12)} 转推</button>
+                </div>`).join('') : '<div class="dim small">暂无推流接入，启动服务后用 OBS 或手机推流试试</div>'}
             </div>
           </div>
         </div>
