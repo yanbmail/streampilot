@@ -694,7 +694,16 @@
         clearTimeout(connectSSE._t);
         connectSSE._t = setTimeout(async () => {
           await SP.refreshState({ silent: true });
-          if (!SP.jobForm.isOpen) SP.render({ keepScroll: true });
+          if (SP.jobForm.isOpen) return;
+          // 播放器页在播或正在输入时禁止整页重渲染：SP.render 会重建 <video>，
+          // 播放历史入库触发的 config 广播会把刚起播的视频整个换掉（表现为播 1~2 秒就停）
+          const v = document.querySelector('#player-video');
+          const urlInput = document.querySelector('#player-url');
+          if (SP.page === 'player' && ((SP.tv.player?.current && v && (v.src || v.currentSrc)) || (urlInput && urlInput.value && document.activeElement === urlInput))) {
+            try { SP.tv.renderPlaylist(); } catch (_) {}
+            return;
+          }
+          SP.render({ keepScroll: true });
         }, 900);
       }
     });

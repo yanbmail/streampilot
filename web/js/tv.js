@@ -458,6 +458,9 @@ SP.tv = (() => {
     else if (player.tab === 'history') items = S.config.player.history || [];
     else items = chState.items || [];
     document.querySelectorAll('[data-pl-tab]').forEach((b) => b.classList.toggle('active', b.dataset.plTab === player.tab));
+    // 局部刷新时同步「收藏 N」计数（整页不重渲染，否则会中断正在播的视频）
+    const favBtn = document.querySelector('[data-pl-tab="favorites"]');
+    if (favBtn) favBtn.textContent = `收藏 ${(S.config.player.favorites || []).length}`;
     if (!items.length) {
       const text = player.tab === 'favorites' ? '还没有收藏频道，播放时点星标即可收藏'
         : player.tab === 'history' ? '还没有播放记录'
