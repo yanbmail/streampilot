@@ -1,0 +1,58 @@
+{
+  "name": "streampilot",
+  "productName": "StreamPilot",
+  "version": "1.0.0",
+  "description": "跨平台推流控制台：多协议推流、屏幕区域采集、IPTV 电视源聚合与转推",
+  "author": "StreamPilot",
+  "license": "MIT",
+  "private": true,
+  "main": "electron/main.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node scripts/launch.js",
+    "serve": "node server/index.js",
+    "dev": "STREAMPILOT_DEV=1 node scripts/launch.js",
+    "dist": "electron-builder",
+    "dist:mac": "electron-builder --mac",
+    "dist:win": "electron-builder --win",
+    "dist:linux": "electron-builder --linux"
+  },
+  "dependencies": {
+    "hls.js": "^1.5.17",
+    "mpegts.js": "^1.8.0"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0"
+  },
+  "build": {
+    "appId": "com.streampilot.app",
+    "productName": "StreamPilot",
+    "files": [
+      "electron/**/*",
+      "server/**/*",
+      "web/**/*",
+      "node_modules/hls.js/dist/hls.min.js",
+      "node_modules/mpegts.js/dist/mpegts.js",
+      "package.json"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "mac": {
+      "category": "public.app-category.video",
+      "target": ["dmg", "zip"],
+      "extendInfo": {
+        "NSCameraUsageDescription": "用于将摄像头画面作为推流源",
+        "NSMicrophoneUsageDescription": "用于采集麦克风声音",
+        "NSScreenCaptureDescription": "用于采集屏幕或屏幕区域作为推流源"
+      }
+    },
+    "win": {
+      "target": ["nsis", "portable"]
+    },
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "category": "AudioVideo"
+    }
+  }
+}
