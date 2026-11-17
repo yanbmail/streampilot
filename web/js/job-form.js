@@ -85,9 +85,9 @@ SP.jobForm = (() => {
         data-set="${k}" data-value="${attr(o.v)}" ${rerender ? 'data-re="1"' : ''}>${o.icon ? icon(o.icon, 13) + ' ' : ''}${h(o.l)}</button>`).join('')}
     </div>`;
   }
-  function switchK(k, label, help = '') {
+  function switchK(k, label, help = '', opts = {}) {
     return `<label class="switch">
-      <input type="checkbox" data-k="${k}" ${v(k) ? 'checked' : ''} />
+      <input type="checkbox" data-k="${k}" ${opts.rerender ? 'data-rerender="1"' : ''} ${v(k) ? 'checked' : ''} />
       <span class="track"></span><span class="lbl">${h(label)}</span>
     </label>${help ? `<div class="help">${help}</div>` : ''}`;
   }
@@ -114,6 +114,8 @@ SP.jobForm = (() => {
     }
     draft.screenMeta = draft.screenMeta || null;
     draft.probeInfo = null;
+    if (!draft.ladder) draft.ladder = { enabled: false, rungs: [] };
+    if (!Array.isArray(draft.ladder.rungs)) draft.ladder.rungs = [];
     commandText = '';
     activeTab = 'source';
     devices = null;
@@ -133,6 +135,13 @@ SP.jobForm = (() => {
           <input type="checkbox" id="jf-autostart" ${draft.autoStart ? 'checked' : ''} />
           <span class="track"></span><span class="lbl">自动启动</span>
         </label>
+      </div>
+      <div class="jf-tplbar">
+        <span class="dim small">${icon('save', 12)} 模板</span>
+        <button type="button" class="btn btn-sm btn-ghost" data-jf="apply-tpl">${icon('copy', 12)} 套用模板</button>
+        <button type="button" class="btn btn-sm btn-ghost" data-jf="save-tpl">${icon('save', 12)} 存为模板</button>
+        <div class="spacer"></div>
+        <span class="dim small" id="jf-tpl-hint">${(SP.templates.list() || []).length} 套可用</span>
       </div>
       <div class="tabs" id="jf-tabs">
         ${TABS.map((t) => `<button type="button" data-tab="${t.id}" class="${t.id === activeTab ? 'active' : ''}">${icon(t.icon, 13)} ${t.label}</button>`).join('')}
@@ -159,6 +168,7 @@ SP.jobForm = (() => {
     root.querySelector('#jf-save').addEventListener('click', () => save(false));
     root.querySelector('#jf-save-start').addEventListener('click', () => save(true));
     root.querySelector('#jf-cmd').addEventListener('click', showCommand);
+    root.querySelectorAll('[data-jf]').forEach((b) => b.addEventListener('click', () => localAction(b.dataset.jf, b.dataset)));
     const del = root.querySelector('#jf-del');
     if (del) del.addEventListener('click', async () => {
       const ok = await SP.util.confirmDlg({
@@ -254,6 +264,69 @@ SP.jobForm = (() => {
         draft.targets.splice(Number(ds.idx), 1);
         renderTab();
       }
+      // ---------- 阶梯转码 ----------
+      if (action === 'add-rung') {
+        const list = draft.ladder.rungs;
+        if (list.length >= 4) return toast('最多 4 档', 'warn');
+        const order = [[1920, 1080], [1280, 720], [854, 480], [640, 360]];
+        const used = new Set(list.map((r) => r.height));
+        const pick = order.find(([, hh]) => !used.has(hh)) || [1280, 720];
+        const rung = blankRung(list.length, pick);
+        list.push(rung);
+        renderTab();
+      }
+      if (action === 'rm-rung') {
+        draft.ladder.rungs.splice(Number(ds.idx), 1);
+        renderTab();
+      }
+      if (action === 'gen-ladder') {
+        const preset = [[1920, 1080, 6000], [1280, 720, 3000], [854, 480, 1200]];
+        draft.ladder.rungs = preset.map(([w, hh, kbps], i) => {
+          const old = draft.ladder.rungs[i] || {};
+          const r = blankRung(i, [w, hh]);
+          r.name = `${hh}P`;
+          r.bitrateKbps = kbps;
+          // 保留已经填好的目标地址，避免一键生成把地址清了
+          if (old.target) r.target = { ...r.target, ...old.target };
+          return r;
+        });
+        draft.ladder.enabled = true;
+        toast('已生成 1080P / 720P / 480P 三档，填好各档地址即可', 'ok', 4000);
+        renderTab();
+      }
+      if (action === 'rung-size') {
+        const [w, hh] = String(ds.size).split('x').map(Number);
+        const rung = draft.ladder.rungs[Number(ds.idx)];
+        if (rung) {
+          rung.width = w;
+          rung.height = hh;
+          if (!rung.name || /^\d+P$/.test(rung.name)) rung.name = `${hh}P`;
+          renderTab();
+        }
+      }
+      // ---------- 模板 ----------
+      if (action === 'apply-tpl') {
+        const tpls = SP.templates.list();
+        if (!tpls.length) return toast('还没有模板，可以先「存为模板」', 'warn');
+        const pick = await pickTemplate(tpls);
+        if (!pick) return;
+        const merged = SP.templates.mergeInto(cleanDraft(), pick);
+        Object.assign(draft, merged);
+        if (!draft.ladder) draft.ladder = { enabled: false, rungs: [] };
+        toast(`已套用模板「${SP.templates.get(pick)?.name || ''}」`, 'ok');
+        renderTab();
+      }
+      if (action === 'save-tpl') {
+        if (!draft.id) {
+          const err = validate();
+          if (err) return toast(`请先补全任务信息：${err}`, 'warn', 4000);
+          const res = await api.createJob({ ...cleanDraft(), autoStart: false });
+          draft.id = res.job.id;
+          isNew = false;
+          toast('任务已先保存，接着填模板信息', 'info', 2600);
+        }
+        SP.templates.openSave({ jobId: draft.id, onSaved: () => SP.refreshState({ silent: true }) });
+      }
       if (action === 'pick-record') {
         const def = draft.record.filePath || `streampilot-${Date.now()}.${draft.record.recordFormat || 'mp4'}`;
         const r = await api.pickSave(def);
@@ -330,8 +403,58 @@ SP.jobForm = (() => {
     }
   }
 
-  async function loadDevices() {
-    try {
+  /** 一档阶梯的空模板 */
+  function blankRung(i, size) {
+    const [w, hh] = size || [1280, 720];
+    return {
+      id: `r${i + 1}`,
+      name: `${hh}P`,
+      width: w,
+      height: hh,
+      fps: Number(draft.video && draft.video.fps) || 30,
+      bitrateKbps: Math.round(hh * 5.5),
+      maxBitrateKbps: 0,
+      preset: (draft.video && draft.video.preset) || 'veryfast',
+      profile: hh >= 720 ? 'high' : 'main',
+      target: {
+        protocol: 'rtmp', host: '', port: 0, app: 'live', streamKey: '', url: '',
+        srtLatency: 200, udpTTL: 1,
+      },
+    };
+  }
+
+  /** 选择一套模板（返回模板 id，取消返回空串） */
+  function pickTemplate(tpls) {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (v) => { if (!done) { done = true; resolve(v); } };
+      const m = openModal(`
+        <div class="modal-head"><div><h3>套用推流模板</h3>
+          <div class="sub">会覆盖画面、音频、推流目标、录制与阶梯设置，输入源保持不变</div></div></div>
+        <div class="modal-body"><div class="tpl-pick-list">
+          ${tpls.map((t) => `<label class="tpl-pick">
+            <input type="radio" name="tpl-pick" value="${attr(t.id)}" />
+            <div style="min-width:0">
+              <div style="font-weight:550" class="ellipsis">${h(t.name)}</div>
+              <div class="small dim ellipsis">${t.video?.mode === 'copy' ? '视频直通' : `${t.video?.width}×${t.video?.height} · ${((t.video?.bitrateKbps || 0) / 1000).toFixed(1)} Mbps`}${t.ladder?.enabled ? ` · 阶梯 ${t.ladder.rungs.length} 档` : ''}</div>
+            </div>
+          </label>`).join('')}
+        </div></div>
+        <div class="modal-foot"><div class="spacer"></div>
+          <button class="btn" data-close>取消</button>
+          <button class="btn btn-primary" id="tp-ok">套用</button>
+        </div>`, { narrow: true, onClose: () => finish('') });
+      m.el.querySelector('#tp-ok').addEventListener('click', () => {
+        const sel = m.el.querySelector('input[name=tpl-pick]:checked');
+        if (!sel) return toast('请选择一个模板', 'warn');
+        const id = sel.value;
+        m.close();
+        finish(id);
+      });
+    });
+  }
+
+  async function loadDevices() {    try {
       const r = await api.devices();
       if (r.ok) devices = r.devices;
     } catch (_) { devices = { screen: [], video: [], audio: [], platform: 'unknown' }; }
@@ -572,6 +695,102 @@ SP.jobForm = (() => {
   }
 
   function targetTab() {
+    const ladderOn = Boolean(draft.ladder && draft.ladder.enabled);
+    const toggle = `<div class="field" style="margin-bottom:14px">
+      ${switchK('ladder.enabled', '多码率阶梯转码（一次解码出多档，分别推不同平台）',
+    '解码只做一次，每档单独编码；适合同时推 1080P 高清平台 + 720P/480P 移动端平台', { rerender: true })}
+    </div>`;
+    if (ladderOn) return toggle + ladderBlock();
+    return toggle + singleTargetTab();
+  }
+
+  /** 阶梯档位编辑：每档一套画质参数 + 自己的推流目标 */
+  function ladderBlock() {
+    const rungs = (draft.ladder && draft.ladder.rungs) || [];
+    return `
+      <div class="section-title" style="margin:4px 0 10px"><h2>阶梯档位</h2><div class="line"></div>
+        <button type="button" class="btn btn-sm" data-local="gen-ladder">${icon('refresh', 12)} 生成 1080/720/480</button>
+        <button type="button" class="btn btn-sm" data-local="add-rung">${icon('plus', 12)} 添加一档</button>
+      </div>
+      <div class="hint-box" style="margin-bottom:10px">${icon('info')}<div>每档填各自的推流地址：比如 1080P 推 YouTube、720P 推 B 站、480P 推抖音。最多 4 档，<b>同步录制跟随第 1 档</b>。</div></div>
+      <div class="fan-list">${rungs.map((r, i) => rungRow(r, i)).join('') || '<div class="empty-inline">还没有档位，点右上角「生成 1080/720/480」一键创建</div>'}</div>
+      ${recordBlock()}`;
+  }
+
+  function rungRow(r, i) {
+    const proto = (r.target && r.target.protocol) || 'rtmp';
+    const t = r.target || {};
+    const needPath = ['rtmp', 'rtmps', 'rtsp'].includes(proto);
+    const sizes = [[1920, 1080, '1080P'], [1280, 720, '720P'], [854, 480, '480P'], [1080, 1920, '竖屏']];
+    return `
+      <div class="fan-row">
+        <div class="fan-top">
+          <span class="fan-idx">${i + 1}</span>
+          <input class="input fan-name" data-k="ladder.rungs.${i}.name" value="${attr(r.name)}" placeholder="档位名称，例如 1080P" />
+          <span class="dim small mono">${r.width}×${r.height} · ${r.bitrateKbps}kbps</span>
+          <button type="button" class="btn btn-sm btn-ghost" data-local="rm-rung" data-idx="${i}" title="移除这一档">${icon('trash', 13)}</button>
+        </div>
+        <div class="form-grid cols-3">
+          <div class="field span-3">
+            <label>分辨率</label>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+              <div class="chips">
+                ${sizes.map(([w, hh, l]) => `<span class="chip ${Number(r.width) === w && Number(r.height) === hh ? 'active' : ''}"
+                  data-local="rung-size" data-idx="${i}" data-size="${w}x${hh}">${l}</span>`).join('')}
+              </div>
+              <input class="input" data-k="ladder.rungs.${i}.width" data-type="num" type="number" value="${r.width}" style="width:88px" />
+              <span class="dim">×</span>
+              <input class="input" data-k="ladder.rungs.${i}.height" data-type="num" type="number" value="${r.height}" style="width:88px" />
+            </div>
+          </div>
+          <div class="field">
+            <label>视频码率</label>
+            <div class="input-suffix"><input class="input" data-k="ladder.rungs.${i}.bitrateKbps" data-type="num" type="number" value="${r.bitrateKbps}" /><span class="unit">kbps</span></div>
+          </div>
+          <div class="field">
+            <label>帧率</label>
+            <input class="input" data-k="ladder.rungs.${i}.fps" data-type="num" type="number" value="${r.fps}" />
+          </div>
+          <div class="field">
+            <label>编码预设</label>
+            <select class="input" data-k="ladder.rungs.${i}.preset">
+              ${['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium'].map((p) => `<option value="${p}" ${p === r.preset ? 'selected' : ''}>${p}</option>`).join('')}
+            </select>
+          </div>
+          <div class="field">
+            <label>协议</label>
+            <select class="input" data-k="ladder.rungs.${i}.target.protocol" data-rerender="1">
+              ${PROTOCOLS.filter((p) => ['rtmp', 'rtmps', 'rtsp', 'srt', 'udp', 'hls'].includes(p.v)).map((p) => `<option value="${p.v}" ${p.v === proto ? 'selected' : ''}>${h(p.l)}</option>`).join('')}
+            </select>
+          </div>
+          ${proto === 'hls' ? '' : `
+          <div class="field span-2">
+            <label>服务器地址</label>
+            <input class="input" data-k="ladder.rungs.${i}.target.host" value="${attr(t.host)}" placeholder="${proto === 'udp' ? '239.0.0.1' : 'live.example.com'}" />
+          </div>`}
+          <div class="field">
+            <label>端口</label>
+            <input class="input" data-k="ladder.rungs.${i}.target.port" data-type="num" type="number" value="${t.port || ''}" placeholder="${proto === 'rtmp' ? '1935' : proto === 'rtsp' ? '8554' : proto === 'srt' ? '9000' : '1234'}" />
+          </div>
+          ${needPath ? `
+          <div class="field">
+            <label>应用名</label>
+            <input class="input" data-k="ladder.rungs.${i}.target.app" value="${attr(t.app)}" placeholder="live" />
+          </div>
+          <div class="field span-2">
+            <label>推流码 / 流名称</label>
+            <input class="input" data-k="ladder.rungs.${i}.target.streamKey" value="${attr(t.streamKey)}" placeholder="stream-key" style="font-family:var(--mono);font-size:12px" />
+          </div>` : ''}
+          ${proto === 'hls' ? `<div class="field span-3"><div class="hint-box">${icon('info')}<div>本机生成 HLS 切片，播放地址：<code>/hls/任务ID_${h(r.id)}/index.m3u8</code></div></div></div>` : ''}
+          <div class="field span-3">
+            <label>完整地址（可选，填了忽略上面的字段）</label>
+            <input class="input" data-k="ladder.rungs.${i}.target.url" value="${attr(t.url)}" placeholder="rtmp://..." style="font-family:var(--mono);font-size:12px" />
+          </div>
+        </div>
+      </div>`;
+  }
+
+  function singleTargetTab() {
     const t = draft.target;
     const notes = {
       rtmp: '标准直播推流协议，B 站 / 抖音 / YouTube / OBS 生态全部支持。端口一般 1935。',
@@ -790,11 +1009,25 @@ SP.jobForm = (() => {
     if (t === 'url' && !draft.source.url) return '请填写网络流地址';
     if (t === 'screen' && devices && devices.screen?.length && draft.source.screen.display === undefined) return '请选择屏幕';
     const tg = draft.target;
-    if (['rtmp', 'rtmps', 'rtsp', 'srt', 'udp'].includes(tg.protocol)) {
-      if (!tg.url && !tg.host) return '请填写推流服务器地址';
-      if (!tg.url && !tg.streamKey && !tg.app) return '请填写推流码 / 流名称';
+    if (draft.ladder && draft.ladder.enabled) {
+      const rungs = draft.ladder.rungs || [];
+      if (rungs.length < 2) return '阶梯转码至少要 2 档';
+      for (let i = 0; i < rungs.length; i++) {
+        const r = rungs[i];
+        const rt = r.target || {};
+        if (['rtmp', 'rtmps', 'rtsp', 'srt', 'udp'].includes(rt.protocol)) {
+          if (!rt.url && !rt.host) return `第 ${i + 1} 档（${r.name}）还没填服务器地址`;
+          if (!rt.url && !rt.streamKey && !rt.app) return `第 ${i + 1} 档（${r.name}）还没填推流码`;
+        }
+        if (r.width % 2 || r.height % 2) return `第 ${i + 1} 档分辨率宽高需为偶数（H.264 要求）`;
+      }
+    } else {
+      if (['rtmp', 'rtmps', 'rtsp', 'srt', 'udp'].includes(tg.protocol)) {
+        if (!tg.url && !tg.host) return '请填写推流服务器地址';
+        if (!tg.url && !tg.streamKey && !tg.app) return '请填写推流码 / 流名称';
+      }
+      if (tg.protocol === 'file' && !tg.filePath) return '请选择录制文件保存路径';
     }
-    if (tg.protocol === 'file' && !tg.filePath) return '请选择录制文件保存路径';
     if (draft.video.mode === 'transcode') {
       if (!(draft.video.width > 0) || !(draft.video.height > 0)) return '输出分辨率不正确';
       if (draft.video.width % 2 || draft.video.height % 2) return '分辨率宽高需为偶数（H.264 要求）';

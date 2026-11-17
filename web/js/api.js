@@ -69,6 +69,24 @@ SP.api = (() => {
     stopPlay: (key) => req('/api/play/stop', { method: 'POST', body: { key } }),
     playerAction: (b) => req('/api/player', { method: 'POST', body: b }),
 
+    // 排播表
+    schedule: () => req('/api/schedule'),
+    createSchedule: (b) => req('/api/schedule', { method: 'POST', body: b }),
+    updateSchedule: (id, b) => req(`/api/schedule/${id}`, { method: 'PATCH', body: b }),
+    deleteSchedule: (id) => req(`/api/schedule/${id}`, { method: 'DELETE' }),
+    toggleSchedule: (enabled) => req('/api/schedule/toggle', { method: 'POST', body: { enabled } }),
+    tickSchedule: () => req('/api/schedule/tick', { method: 'POST' }),
+    runSchedule: (id, minutes) => req(`/api/schedule/${id}/run`, { method: 'POST', body: { minutes } }),
+    stopSchedule: (id) => req(`/api/schedule/${id}/stop`, { method: 'POST' }),
+
+    // 推流模板
+    templates: () => req('/api/templates'),
+    saveTemplate: (b) => req('/api/templates', { method: 'POST', body: b }),
+    updateTemplate: (id, b) => req(`/api/templates/${id}`, { method: 'PATCH', body: b }),
+    deleteTemplate: (id) => req(`/api/templates/${id}`, { method: 'DELETE' }),
+    applyTemplate: (id, jobIds) => req(`/api/templates/${id}/apply`, { method: 'POST', body: { jobIds } }),
+    newJobFromTemplate: (id, b) => req(`/api/templates/${id}/new-job`, { method: 'POST', body: b || {} }),
+
     settings: (b) => req('/api/settings', { method: 'POST', body: b }),
     backups: () => req('/api/backups'),
     createBackup: () => req('/api/backups', { method: 'POST' }),
@@ -86,7 +104,7 @@ SP.api = (() => {
       const open = () => {
         es = new EventSource(`/api/events${qs}`);
         es.addEventListener('message', (e) => onEvent('message', safe(e.data)));
-        for (const name of ['stats', 'log', 'job-state', 'config', 'iptv', 'iptv-refresh', 'hello']) {
+        for (const name of ['stats', 'log', 'job-state', 'config', 'iptv', 'iptv-refresh', 'hello', 'rtmp', 'schedule']) {
           es.addEventListener(name, (e) => onEvent(name, safe(e.data)));
         }
         es.onerror = () => {

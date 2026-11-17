@@ -306,6 +306,87 @@ class FFmpegService {
     return { args: [...pre, ...input], filterPrefix, audioFromLavfi };
   }
 
+  /** 缩放/补边滤镜链：fit 等比加黑边、cover 填满裁剪、stretch 拉伸 */
+  scaleFilters(width, height, fps, scaling = 'fit') {
+    const W = width || 1920;
+    const H = height || 1080;
+    const vf = [];
+    if (scaling === 'cover') {
+      vf.push(`scale=${W}:${H}:force_original_aspect_ratio=increase:flags=bicubic`, `crop=${W}:${H}`);
+    } else if (scaling === 'stretch') {
+      vf.push(`scale=${W}:${H}:flags=bicubic`);
+    } else {
+      vf.push(`scale=${W}:${H}:force_original_aspect_ratio=decrease:flags=bicubic`,
+        `pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=black`);
+    }
+    vf.push('setsar=1', `fps=${fps || 30}`, 'format=yuv420p');
+    return vf.join(',');
+  }
+
+  /**
+   * 视频编码参数（不含滤镜与容器）。
+   * v 既可以是 job.video，也可以是阶梯里的某一档，结构一致。
+   */
+  videoEncodeArgs(v, ctx = {}) {
+    const args = [];
+    const gop = Math.max(1, Math.round((v.fps || 30) * (v.gopSeconds || 2)));
+
+    if (v.mode === 'copy') {
+      args.push('-c:v', 'copy');
+      if (ctx.filterPrefix?.length && ctx.warn) ctx.warn('直通模式下画面裁剪/缩放参数将被忽略');
+      return args;
+    }
+
+    const enc = this.resolveEncoder(v);
+    if (enc.fallback && ctx.warn) ctx.warn(`编码器 ${enc.original} 不可用，已自动切换为 ${enc.encoder}`);
+    if (enc.encoder === 'libx264' || enc.encoder === 'libx265') {
+      const preset = v.preset || 'veryfast';
+      args.push('-c:v', enc.encoder, '-preset', preset);
+      if (enc.encoder === 'libx264') {
+        args.push('-tune', 'zerolatency', '-profile:v', v.profile || 'high', '-pix_fmt', 'yuv420p');
+      }
+      const maxr = v.maxBitrateKbps > 0 ? v.maxBitrateKbps : Math.round(v.bitrateKbps * 1.15);
+      if (v.rateControl === 'crf') {
+        args.push('-crf', String(v.crf), '-maxrate', `${maxr}k`, '-bufsize', `${maxr * 2}k`);
+      } else if (v.rateControl === 'vbr') {
+        args.push('-b:v', `${v.bitrateKbps}k`, '-maxrate', `${maxr}k`, '-bufsize', `${v.bitrateKbps * 2}k`);
+      } else {
+        args.push('-b:v', `${v.bitrateKbps}k`, '-minrate', `${v.bitrateKbps}k`,
+          '-maxrate', `${v.bitrateKbps}k`, '-bufsize', `${v.bitrateKbps * 2}k`);
+      }
+      if (enc.encoder === 'libx264') {
+        const params = [`keyint=${gop}`, `min-keyint=${gop}`, 'scenecut=0', 'force-cfr=1'];
+        if (v.rateControl === 'cbr') params.push('nal-hrd=cbr');
+        args.push('-x264-params', params.join(':'));
+      } else {
+        const params = [`keyint=${gop}`, `min-keyint=${gop}`, 'scenecut=0'];
+        if (v.rateControl === 'cbr') params.push('nal-hrd=cbr', `vbv-maxrate=${v.bitrateKbps}`, `vbv-bufsize=${v.bitrateKbps * 2}`);
+        args.push('-x265-params', params.join(':'), '-tag:v', 'hvc1');
+      }
+    } else {
+      const hw = enc.encoder.includes('videotoolbox');
+      args.push('-c:v', enc.encoder, '-pix_fmt', 'yuv420p');
+      args.push('-b:v', `${v.bitrateKbps}k`);
+      if (hw) {
+        args.push('-maxrate', `${v.maxBitrateKbps || v.bitrateKbps}k`,
+          '-bufsize', `${(v.maxBitrateKbps || v.bitrateKbps) * 2}k`,
+          '-realtime', '1', '-prio_speed', '1');
+        if (enc.encoder === 'h264_videotoolbox') args.push('-profile:v', v.profile || 'high');
+        if (enc.encoder === 'hevc_videotoolbox') args.push('-tag:v', 'hvc1');
+      }
+    }
+    args.push('-g', String(gop), '-keyint_min', String(gop), '-sc_threshold', '0');
+    return args;
+  }
+
+  /** 音频编码参数 */
+  audioEncodeArgs(a, audioFromLavfi = false) {
+    if (a.mode === 'none') return ['-an'];
+    if (a.mode === 'copy') return audioFromLavfi ? ['-c:a', 'copy', '-c:a', 'aac'] : ['-c:a', 'copy'];
+    const codec = a.codec === 'opus' ? 'libopus' : a.codec === 'mp3' ? 'libmp3lame' : a.codec === 'ac3' ? 'ac3' : 'aac';
+    return ['-c:a', codec, '-b:a', `${a.bitrateKbps}k`, '-ar', String(a.sampleRate), '-ac', String(a.channels)];
+  }
+
   /** 构建输出编码参数 */
   buildOutput(job, ctx) {
     const v = job.video;
@@ -313,81 +394,17 @@ class FFmpegService {
     const t = job.target;
     const adv = job.advanced;
     const args = [];
-    const gop = Math.max(1, Math.round((v.fps || 30) * (v.gopSeconds || 2)));
+    args.push(...this.videoEncodeArgs(v, ctx));
 
-    if (v.mode === 'copy') {
-      args.push('-c:v', 'copy');
-      if (ctx.filterPrefix.length) ctx.warn('直通模式下画面裁剪/缩放参数将被忽略');
-    } else {
-      const enc = this.resolveEncoder(v);
-      if (enc.fallback) ctx.warn(`编码器 ${enc.original} 不可用，已自动切换为 ${enc.encoder}`);
-      if (enc.encoder === 'libx264' || enc.encoder === 'libx265') {
-        const preset = v.preset || 'veryfast';
-        args.push('-c:v', enc.encoder, '-preset', preset);
-        if (enc.encoder === 'libx264') {
-          args.push('-tune', 'zerolatency', '-profile:v', v.profile || 'high', '-pix_fmt', 'yuv420p');
-        }
-        const maxr = v.maxBitrateKbps > 0 ? v.maxBitrateKbps : Math.round(v.bitrateKbps * 1.15);
-        if (v.rateControl === 'crf') {
-          args.push('-crf', String(v.crf), '-maxrate', `${maxr}k`, '-bufsize', `${maxr * 2}k`);
-        } else if (v.rateControl === 'vbr') {
-          args.push('-b:v', `${v.bitrateKbps}k`, '-maxrate', `${maxr}k`, '-bufsize', `${v.bitrateKbps * 2}k`);
-        } else {
-          args.push('-b:v', `${v.bitrateKbps}k`, '-minrate', `${v.bitrateKbps}k`,
-            '-maxrate', `${v.bitrateKbps}k`, '-bufsize', `${v.bitrateKbps * 2}k`);
-        }
-        if (enc.encoder === 'libx264') {
-          const params = [`keyint=${gop}`, `min-keyint=${gop}`, 'scenecut=0', 'force-cfr=1'];
-          if (v.rateControl === 'cbr') params.push('nal-hrd=cbr');
-          args.push('-x264-params', params.join(':'));
-        } else {
-          const params = [`keyint=${gop}`, `min-keyint=${gop}`, 'scenecut=0'];
-          if (v.rateControl === 'cbr') params.push('nal-hrd=cbr', `vbv-maxrate=${v.bitrateKbps}`, `vbv-bufsize=${v.bitrateKbps * 2}`);
-          args.push('-x265-params', params.join(':'), '-tag:v', 'hvc1');
-        }
-      } else {
-        const hw = enc.encoder.includes('videotoolbox');
-        args.push('-c:v', enc.encoder, '-pix_fmt', 'yuv420p');
-        args.push('-b:v', `${v.bitrateKbps}k`);
-        if (hw) {
-          args.push('-maxrate', `${v.maxBitrateKbps || v.bitrateKbps}k`,
-            '-bufsize', `${(v.maxBitrateKbps || v.bitrateKbps) * 2}k`,
-            '-realtime', '1', '-prio_speed', '1');
-          if (enc.encoder === 'h264_videotoolbox') args.push('-profile:v', v.profile || 'high');
-          if (enc.encoder === 'hevc_videotoolbox') args.push('-tag:v', 'hvc1');
-        }
-      }
-      args.push('-g', String(gop), '-keyint_min', String(gop), '-sc_threshold', '0');
-    }
 
     // 视频滤镜
     const vf = [];
     if (ctx.filterPrefix.length) vf.push(...ctx.filterPrefix);
-    if (v.mode !== 'copy') {
-      const W = v.width || 1920;
-      const H = v.height || 1080;
-      if (v.scaling === 'cover') {
-        vf.push(`scale=${W}:${H}:force_original_aspect_ratio=increase:flags=bicubic`, `crop=${W}:${H}`);
-      } else if (v.scaling === 'stretch') {
-        vf.push(`scale=${W}:${H}:flags=bicubic`);
-      } else {
-        vf.push(`scale=${W}:${H}:force_original_aspect_ratio=decrease:flags=bicubic`,
-          `pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=black`);
-      }
-      vf.push('setsar=1', `fps=${v.fps || 30}`, 'format=yuv420p');
-    }
+    if (v.mode !== 'copy') vf.push(this.scaleFilters(v.width, v.height, v.fps, v.scaling));
     if (vf.length) args.push('-vf', vf.join(','));
 
     // 音频
-    if (a.mode === 'none') {
-      args.push('-an');
-    } else if (a.mode === 'copy') {
-      args.push('-c:a', 'copy');
-      if (ctx.audioFromLavfi) args.push('-c:a', 'aac');
-    } else {
-      const codec = a.codec === 'opus' ? 'libopus' : a.codec === 'mp3' ? 'libmp3lame' : a.codec === 'ac3' ? 'ac3' : 'aac';
-      args.push('-c:a', codec, '-b:a', `${a.bitrateKbps}k`, '-ar', String(a.sampleRate), '-ac', String(a.channels));
-    }
+    args.push(...this.audioEncodeArgs(a, ctx.audioFromLavfi));
 
     // 输出容器
     const tgt = ctx.target;
@@ -436,9 +453,9 @@ class FFmpegService {
     return args;
   }
 
-  /** 清空并返回本任务的 HLS 输出目录 */
-  prepareHlsDir(job, ctx) {
-    const dir = ensureDir(path.join(ctx.hlsRoot, job.id));
+  /** 清空并返回本任务的 HLS 输出目录（suffix 用于阶梯转码按档分目录） */
+  prepareHlsDir(job, ctx, suffix = '') {
+    const dir = ensureDir(path.join(ctx.hlsRoot, `${job.id}${suffix}`));
     for (const f of fs.readdirSync(dir)) {
       if (/\.(ts|m4s|mp4|m3u8|tmp)$/.test(f)) { try { fs.unlinkSync(path.join(dir, f)); } catch (_) {} }
     }
@@ -514,8 +531,111 @@ class FFmpegService {
     return slaves.join('|');
   }
 
+  /** 是否走阶梯转码：一次解码出多档，每档独立编码 + 独立目标 */
+  ladderActive(job) {
+    const l = job.ladder || {};
+    return Boolean(l.enabled && Array.isArray(l.rungs) && l.rungs.length >= 2 && job.video.mode !== 'copy');
+  }
+
+  /** 阶梯中某一档的容器参数与目标地址 */
+  rungMuxerArgs(rung, job, ctx) {
+    const spec = buildTargetUrl(rung.target);
+    const t = rung.target || {};
+    const args = [];
+    if (spec.muxer === 'flv') {
+      args.push('-f', 'flv', ...(spec.extra || []));
+    } else if (spec.muxer === 'rtsp') {
+      args.push('-f', 'rtsp', ...(spec.extra || []));
+    } else if (spec.muxer === 'mpegts') {
+      args.push('-f', 'mpegts', '-mpegts_flags', '+resend_headers');
+    } else if (spec.muxer === 'hls') {
+      const dir = this.prepareHlsDir(job, ctx, `_${rung.id}`);
+      args.push('-f', 'hls',
+        '-hls_time', String(t.hlsSegmentSeconds || 2),
+        '-hls_list_size', String(t.hlsListSize || 6),
+        '-hls_flags', 'delete_segments+append_list+omitendlist+temp_file',
+        '-hls_segment_type', 'mpegts',
+        '-hls_segment_filename', path.join(dir, 'seg_%06d.ts'));
+      return { args, url: path.join(dir, 'index.m3u8'), spec };
+    } else if (!spec.muxer) {
+      const ext = path.extname(spec.url || '').toLowerCase();
+      if (ext === '.mp4') args.push('-f', 'mp4', '-movflags', '+faststart');
+      else if (ext === '.mkv') args.push('-f', 'matroska');
+      else if (ext === '.ts') args.push('-f', 'mpegts');
+      else args.push('-f', 'matroska');
+    } else {
+      args.push('-f', spec.muxer);
+    }
+    return { args, url: spec.url || '-', spec };
+  }
+
+  /**
+   * 多码率阶梯转码：只解码一次，用 split 分出 N 条分支各自缩放编码，
+   * 再分别输出到各自的平台。相比跑 N 个 ffmpeg 进程，解码开销只算一次。
+   */
+  buildLadderArgs(job, ctx) {
+    const { args: inArgs, filterPrefix, audioFromLavfi } = this.buildInput(job, ctx);
+    const isTest = job.source.type === 'test';
+    const audioIn = isTest
+      ? [...(job.advanced.realtime ? ['-re'] : []), '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=44100']
+      : [];
+    const audioIdx = isTest ? 1 : 0;
+    const rungs = job.ladder.rungs;
+    const adv = job.advanced;
+    const rec = job.record || {};
+
+    const pre = filterPrefix.length ? `${filterPrefix.join(',')},` : '';
+    const chain = [`[0:v:0]${pre}split=${rungs.length}${rungs.map((_, i) => `[s${i}]`).join('')}`];
+    rungs.forEach((r, i) => {
+      chain.push(`[s${i}]${this.scaleFilters(r.width, r.height, r.fps, job.video.scaling)}[v${i}]`);
+    });
+
+    const args = [...inArgs, ...audioIn, '-filter_complex', chain.join(';')];
+
+    rungs.forEach((r, i) => {
+      const enc = {
+        ...job.video,
+        mode: 'transcode',
+        width: r.width,
+        height: r.height,
+        fps: r.fps,
+        bitrateKbps: r.bitrateKbps,
+        maxBitrateKbps: r.maxBitrateKbps,
+        preset: r.preset,
+        profile: r.profile,
+      };
+      const mux = this.rungMuxerArgs(r, job, ctx);
+      args.push('-map', `[v${i}]`);
+      if (job.audio.mode !== 'none') args.push('-map', `${audioIdx}:a:0`);
+      args.push(...this.videoEncodeArgs(enc, ctx));
+      args.push(...this.audioEncodeArgs(job.audio, audioFromLavfi));
+      args.push('-max_muxing_queue_size', '1024');
+
+      // 第一档顺带录制：同一份编码用 tee 再写一份文件，不重复转码
+      const wantRecord = i === 0 && rec.enabled && rec.filePath;
+      if (wantRecord && mux.spec.muxer !== 'hls') {
+        ensureDir(path.dirname(rec.filePath));
+        const fmt = rec.recordFormat === 'ts' ? 'mpegts' : rec.recordFormat === 'mkv' ? 'matroska' : 'mp4';
+        const slaves = [
+          this.slaveSpec({ muxer: mux.spec.muxer || 'matroska', url: mux.url }),
+          this.slaveSpec({ muxer: fmt, url: rec.filePath }, { ignore: true }),
+        ];
+        args.push('-flags', '+global_header', '-f', 'tee', slaves.join('|'));
+        return;
+      }
+      if (wantRecord) ctx.warn('阶梯转码首档为本地 HLS，无法同时写录制文件，已跳过录制');
+
+      args.push(...mux.args);
+      if (adv.extraOutputArgs) args.push(...String(adv.extraOutputArgs).split(/\s+/).filter(Boolean));
+      args.push(mux.url);
+    });
+
+    return args;
+  }
+
   /** 完整推流命令 */
   buildStreamArgs(job, ctx) {
+    if (this.ladderActive(job)) return this.buildLadderArgs(job, ctx);
     const { args: inArgs, filterPrefix, audioFromLavfi } = this.buildInput(job, ctx);
     const innerCtx = { ...ctx, filterPrefix, audioFromLavfi };
     if (job.source.type === 'test') {

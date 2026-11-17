@@ -7,7 +7,33 @@ const {
   uid, ensureDir, atomicWrite, readJson, debounce, clamp,
 } = require('./util');
 
-const CONFIG_VERSION = 3;
+const CONFIG_VERSION = 4;
+
+/** 单个推流目标的默认字段 */
+function targetDefaults() {
+  return {
+    protocol: 'rtmp', // rtmp | rtmps | rtsp | srt | udp | hls | file | flv
+    host: '',
+    port: 0,
+    app: 'live',
+    streamKey: '',
+    url: '', // 直填完整地址时优先使用
+    srtLatency: 200,
+    srtPassphrase: '',
+    udpTTL: 1,
+    hlsDir: '',
+    hlsSegmentSeconds: 2,
+    hlsListSize: 6,
+    filePath: '',
+    recordFormat: 'mp4',
+    flvListenPort: 8380,
+  };
+}
+
+/** 阶梯转码默认结构：一次解码出多档，分别推不同平台 */
+function ladderDefaults() {
+  return { enabled: false, rungs: [] };
+}
 
 function jobDefaults() {
   return {
@@ -56,23 +82,7 @@ function jobDefaults() {
       sampleRate: 44100,
       channels: 2,
     },
-    target: {
-      protocol: 'rtmp', // rtmp | rtmps | rtsp | srt | udp | hls | file | flv
-      host: '',
-      port: 0,
-      app: 'live',
-      streamKey: '',
-      url: '', // 直填完整地址时优先使用
-      srtLatency: 200,
-      srtPassphrase: '',
-      udpTTL: 1,
-      hlsDir: '',
-      hlsSegmentSeconds: 2,
-      hlsListSize: 6,
-      filePath: '',
-      recordFormat: 'mp4',
-      flvListenPort: 8380,
-    },
+    target: targetDefaults(),
     advanced: {
       reconnect: true,
       reconnectDelaySec: 3,
@@ -93,6 +103,8 @@ function jobDefaults() {
       filePath: '',
       recordFormat: 'mp4', // mp4 | ts | mkv
     },
+    // 多码率阶梯转码：一次解码出多档，每档推各自的平台
+    ladder: ladderDefaults(),
   };
 }
 
@@ -131,6 +143,13 @@ function defaultConfig() {
       },
     },
     jobs: [],
+    // 一周排播表：按天 + 时段自动开播 / 自动停播
+    schedule: {
+      enabled: true,
+      tasks: [],
+    },
+    // 推流模板：一套码率/分辨率/目标存起来，新任务一键套用
+    templates: [],
     player: {
       history: [],
       favorites: [],
@@ -155,6 +174,71 @@ function deepDefaults(base, override) {
 
 const PROTOCOLS = ['rtmp', 'rtmps', 'rtsp', 'srt', 'udp', 'hls', 'file', 'flv'];
 const SOURCE_TYPES = ['test', 'file', 'files', 'screen', 'camera', 'url'];
+
+/** 规范化一个推流目标（主目标 / 附加目标 / 阶梯某档共用） */
+function normalizeTarget(input = {}) {
+  const t = { ...targetDefaults(), ...(input || {}) };
+  if (!PROTOCOLS.includes(t.protocol)) t.protocol = 'rtmp';
+  t.port = clamp(t.port, 0, 65535, 0);
+  t.srtLatency = clamp(t.srtLatency, 20, 8000, 200);
+  t.udpTTL = clamp(t.udpTTL, 0, 255, 1);
+  t.hlsSegmentSeconds = clamp(t.hlsSegmentSeconds, 1, 15, 2);
+  t.hlsListSize = clamp(t.hlsListSize, 2, 60, 6);
+  t.flvListenPort = clamp(t.flvListenPort, 1024, 65535, 8380);
+  t.app = String(t.app || 'live').replace(/^\/+|\/+$/g, '');
+  t.streamKey = String(t.streamKey || '');
+  t.host = String(t.host || '');
+  t.url = String(t.url || '').trim();
+  t.filePath = String(t.filePath || '');
+  return t;
+}
+
+/**
+ * 按目标高度推荐三档阶梯（1080 / 720 / 480）。
+ * 前端「一键生成阶梯」与后端兜底都用它，避免两边算得不一样。
+ */
+function suggestRungs(video = {}) {
+  const baseH = clamp(video.height, 240, 2160, 1080);
+  const baseFps = clamp(video.fps, 1, 120, 30);
+  const tiers = [
+    { h: 1080, kbps: 6000 },
+    { h: 720, kbps: 3000 },
+    { h: 480, kbps: 1200 },
+  ].filter((x) => x.h <= Math.max(480, baseH));
+  const list = tiers.length ? tiers : [{ h: baseH, kbps: Math.round(baseH * 5.5) }];
+  return list.map((t, i) => ({
+    id: `r${i + 1}`,
+    name: `${t.h}P`,
+    width: Math.round((t.h * 16) / 9 / 2) * 2,
+    height: t.h,
+    fps: Math.min(baseFps, t.h >= 720 ? baseFps : 30),
+    bitrateKbps: t.kbps,
+    maxBitrateKbps: 0,
+    preset: video.preset || 'veryfast',
+    profile: t.h >= 720 ? 'high' : 'main',
+    target: targetDefaults(),
+  }));
+}
+
+function normalizeRung(r = {}, i = 0, job = {}) {
+  const v = job.video || {};
+  let width = clamp(r.width, 128, 7680, 1280);
+  let height = clamp(r.height, 128, 4320, 720);
+  width -= width % 2;
+  height -= height % 2;
+  return {
+    id: String(r.id || `r${i + 1}`).slice(0, 12),
+    name: String(r.name || `${height}P`).slice(0, 24),
+    width,
+    height,
+    fps: clamp(r.fps || v.fps, 1, 120, 30),
+    bitrateKbps: clamp(r.bitrateKbps, 100, 200000, Math.round(height * 5.5)),
+    maxBitrateKbps: clamp(r.maxBitrateKbps, 0, 200000, 0),
+    preset: String(r.preset || v.preset || 'veryfast'),
+    profile: ['baseline', 'main', 'high'].includes(r.profile) ? r.profile : (height >= 720 ? 'high' : 'main'),
+    target: normalizeTarget(r.target || {}),
+  };
+}
 
 function normalizeJob(input = {}, prev = null) {
   const base = prev ? JSON.parse(JSON.stringify(prev)) : jobDefaults();
@@ -201,16 +285,7 @@ function normalizeJob(input = {}, prev = null) {
   a.sampleRate = clamp(a.sampleRate, 8000, 192000, 44100);
   a.channels = clamp(a.channels, 1, 8, 2);
 
-  const t = merged.target;
-  if (!PROTOCOLS.includes(t.protocol)) t.protocol = 'rtmp';
-  t.port = clamp(t.port, 0, 65535, 0);
-  t.srtLatency = clamp(t.srtLatency, 20, 8000, 200);
-  t.udpTTL = clamp(t.udpTTL, 0, 255, 1);
-  t.hlsSegmentSeconds = clamp(t.hlsSegmentSeconds, 1, 15, 2);
-  t.hlsListSize = clamp(t.hlsListSize, 2, 60, 6);
-  t.flvListenPort = clamp(t.flvListenPort, 1024, 65535, 8380);
-  t.app = String(t.app || 'live').replace(/^\/+|\/+$/g, '');
-  t.streamKey = String(t.streamKey || '');
+  merged.target = normalizeTarget(merged.target);
 
   const adv = merged.advanced;
   adv.reconnectDelaySec = clamp(adv.reconnectDelaySec, 1, 120, 3);
@@ -220,18 +295,8 @@ function normalizeJob(input = {}, prev = null) {
   // 附加分发目标（一份编码推多路）
   const rawTargets = Array.isArray(merged.targets) ? merged.targets : [];
   merged.targets = rawTargets.slice(0, 8).map((x) => {
-    const o = {
-      protocol: PROTOCOLS.includes(x.protocol) ? x.protocol : 'rtmp',
-      host: String(x.host || ''),
-      port: clamp(x.port, 0, 65535, 0),
-      app: String(x.app || 'live').replace(/^\/+|\/+$/g, ''),
-      streamKey: String(x.streamKey || ''),
-      url: String(x.url || '').trim(),
-      name: String(x.name || '').slice(0, 60),
-      srtLatency: clamp(x.srtLatency, 20, 8000, 200),
-      srtPassphrase: String(x.srtPassphrase || ''),
-      udpTTL: clamp(x.udpTTL, 0, 255, 1),
-    };
+    const o = normalizeTarget(x);
+    o.name = String(x.name || '').slice(0, 60);
     // 空行（没填任何地址）直接丢弃，避免生成无效 slave
     const empty = !o.url && !o.host && !o.streamKey;
     return empty ? null : o;
@@ -248,6 +313,15 @@ function normalizeJob(input = {}, prev = null) {
     const ext = path.extname(rec.filePath).toLowerCase().replace('.', '');
     if (['mp4', 'ts', 'mkv', 'flv', 'mov'].includes(ext)) rec.recordFormat = ext === 'mov' ? 'mp4' : ext;
   }
+
+  // 多码率阶梯转码（一次解码出多档，每档推各自的平台）
+  const ladder = merged.ladder || ladderDefaults();
+  ladder.enabled = Boolean(ladder.enabled);
+  const rawRungs = Array.isArray(ladder.rungs) ? ladder.rungs : [];
+  ladder.rungs = rawRungs.slice(0, 4).map((r, i) => normalizeRung(r, i, merged));
+  if (ladder.enabled && ladder.rungs.length < 2) ladder.rungs = suggestRungs(merged.video);
+  if (ladder.rungs.length < 2) ladder.enabled = false;
+  merged.ladder = ladder;
 
   return merged;
 }
@@ -301,6 +375,76 @@ function buildTargetUrl(t) {
   }
 }
 
+/** 把 "HH:MM" / "H:M" / "HHMM" 统一成 "HH:MM"，非法值退回 fallback */
+function normalizeClock(value, fallback = '20:00') {
+  const m = /^(\d{1,2})[:：]?(\d{2})$/.exec(String(value || '').trim());
+  if (!m) return fallback;
+  const hh = Number(m[1]);
+  const mm = Number(m[2]);
+  if (hh > 23 || mm > 59) return fallback;
+  return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+}
+
+/** 一条排播计划：每周哪几天、几点开、几点停 */
+function normalizeScheduleTask(input = {}, prev = null) {
+  const base = { ...(prev || {}), ...(input || {}) };
+  const days = Array.isArray(base.days)
+    ? [...new Set(base.days.map((d) => Number(d)).filter((d) => Number.isInteger(d) && d >= 0 && d <= 6))].sort()
+    : [];
+  const endMode = base.endMode === 'duration' ? 'duration' : 'time';
+  return {
+    id: prev?.id || String(base.id || '').trim() || uid('sch'),
+    name: String(base.name || '未命名排播').slice(0, 60),
+    jobId: String(base.jobId || ''),
+    enabled: base.enabled === undefined ? true : Boolean(base.enabled),
+    days,
+    start: normalizeClock(base.start, '20:00'),
+    end: normalizeClock(base.end, '22:00'),
+    endMode,
+    durationMin: clamp(base.durationMin, 1, 1440, 60),
+    note: String(base.note || '').slice(0, 300),
+    createdAt: prev?.createdAt || Number(base.createdAt) || Date.now(),
+    updatedAt: Date.now(),
+  };
+}
+
+/** 推流模板：保存一套画面/音频/目标配置，新任务一键套用 */
+function normalizeTemplate(input = {}, prev = null) {
+  const base = { ...(prev || {}), ...(input || {}) };
+  const job = normalizeJob({
+    ...(prev ? JSON.parse(JSON.stringify(prev)) : {}),
+    ...base,
+    name: base.name || '未命名模板',
+    id: prev?.id || base.id || uid('tpl'),
+  }, null);
+  return {
+    id: job.id,
+    name: String(base.name || '未命名模板').slice(0, 60),
+    desc: String(base.desc || '').slice(0, 300),
+    icon: String(base.icon || '').slice(0, 8),
+    video: job.video,
+    audio: job.audio,
+    target: job.target,
+    targets: job.targets,
+    record: job.record,
+    ladder: job.ladder,
+    advanced: job.advanced,
+    createdAt: prev?.createdAt || Number(base.createdAt) || Date.now(),
+    updatedAt: Date.now(),
+  };
+}
+
+/** 把模板内容套到任务上（只覆盖模板包含的字段） */
+function applyTemplate(job, template) {
+  if (!template) return job;
+  const patch = { ...job };
+  for (const key of ['video', 'audio', 'target', 'targets', 'record', 'ladder', 'advanced']) {
+    if (template[key] === undefined || template[key] === null) continue;
+    patch[key] = JSON.parse(JSON.stringify(template[key]));
+  }
+  return normalizeJob(patch, job);
+}
+
 class Store extends EventEmitter {
   constructor(dataDir) {
     super();
@@ -320,7 +464,11 @@ class Store extends EventEmitter {
     const raw = readJson(this.configPath, null);
     if (raw) {
       const merged = deepDefaults(defaultConfig(), raw);
+      merged.version = CONFIG_VERSION;
       merged.jobs = (merged.jobs || []).map((j) => normalizeJob(j, null));
+      merged.schedule = merged.schedule || { enabled: true, tasks: [] };
+      merged.schedule.tasks = (merged.schedule.tasks || []).map((t) => normalizeScheduleTask(t, null));
+      merged.templates = (merged.templates || []).map((t) => normalizeTemplate(t, null));
       this.config = merged;
     } else {
       this.config = defaultConfig();
@@ -410,7 +558,11 @@ class Store extends EventEmitter {
     if (!raw) throw new Error('备份文件内容无效');
     this.maybeSnapshot(true);
     const merged = deepDefaults(defaultConfig(), raw);
+    merged.version = CONFIG_VERSION;
     merged.jobs = (merged.jobs || []).map((j) => normalizeJob(j, null));
+    merged.schedule = merged.schedule || { enabled: true, tasks: [] };
+    merged.schedule.tasks = (merged.schedule.tasks || []).map((t) => normalizeScheduleTask(t, null));
+    merged.templates = (merged.templates || []).map((t) => normalizeTemplate(t, null));
     this.config = merged;
     this.config.settings.dataDir = this.dataDir;
     this.saveNow();
@@ -448,9 +600,82 @@ class Store extends EventEmitter {
     this.touch('settings');
     return this.config.settings;
   }
+
+  /* ---------------- 排播表 ---------------- */
+  get schedule() {
+    if (!this.config.schedule) this.config.schedule = { enabled: true, tasks: [] };
+    if (!Array.isArray(this.config.schedule.tasks)) this.config.schedule.tasks = [];
+    return this.config.schedule;
+  }
+
+  listScheduleTasks() {
+    return this.schedule.tasks;
+  }
+
+  getScheduleTask(id) {
+    return this.schedule.tasks.find((t) => t.id === id) || null;
+  }
+
+  upsertScheduleTask(input = {}) {
+    const prev = input.id ? this.getScheduleTask(input.id) : null;
+    const task = normalizeScheduleTask(input, prev);
+    if (prev) {
+      const idx = this.schedule.tasks.findIndex((t) => t.id === prev.id);
+      this.schedule.tasks[idx] = task;
+    } else {
+      this.schedule.tasks.push(task);
+    }
+    this.touch('schedule');
+    return task;
+  }
+
+  removeScheduleTask(id) {
+    const idx = this.schedule.tasks.findIndex((t) => t.id === id);
+    if (idx < 0) return false;
+    this.schedule.tasks.splice(idx, 1);
+    this.touch('schedule');
+    return true;
+  }
+
+  setScheduleEnabled(enabled) {
+    this.schedule.enabled = Boolean(enabled);
+    this.touch('schedule');
+    return this.schedule.enabled;
+  }
+
+  /* ---------------- 模板 ---------------- */
+  listTemplates() {
+    if (!Array.isArray(this.config.templates)) this.config.templates = [];
+    return this.config.templates;
+  }
+
+  getTemplate(id) {
+    return this.listTemplates().find((t) => t.id === id) || null;
+  }
+
+  upsertTemplate(input = {}) {
+    const prev = input.id ? this.getTemplate(input.id) : null;
+    const tpl = normalizeTemplate(input, prev);
+    const list = this.listTemplates();
+    if (prev) list[list.findIndex((t) => t.id === prev.id)] = tpl;
+    else list.push(tpl);
+    this.touch('template');
+    return tpl;
+  }
+
+  removeTemplate(id) {
+    const list = this.listTemplates();
+    const idx = list.findIndex((t) => t.id === id);
+    if (idx < 0) return false;
+    list.splice(idx, 1);
+    this.touch('template');
+    return true;
+  }
 }
 
 module.exports = {
   Store, defaultConfig, jobDefaults, normalizeJob, buildTargetUrl, deepDefaults,
+  normalizeTarget, targetDefaults, ladderDefaults, normalizeRung, suggestRungs,
+  normalizeScheduleTask, normalizeClock, normalizeTemplate, applyTemplate,
   PROTOCOLS, SOURCE_TYPES, CONFIG_VERSION,
 };

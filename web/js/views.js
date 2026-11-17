@@ -243,8 +243,10 @@ SP.views = (() => {
       const running = isRunning(r.status);
       const fanCount = (job.targets || []).filter((x) => x.url || x.host).length;
       const recOn = Boolean(job.record && job.record.enabled);
+      const ladderN = job.ladder && job.ladder.enabled ? (job.ladder.rungs || []).length : 0;
       const tags = [
-        fanCount ? `<span class="tag-fan">+${fanCount} 路</span>` : '',
+        ladderN ? `<span class="tag-fan">阶梯 ${ladderN} 档</span>` : '',
+        ladderN ? '' : (fanCount ? `<span class="tag-fan">+${fanCount} 路</span>` : ''),
         recOn ? '<span class="tag-rec">● 录制</span>' : '',
       ].join('');
       return `<tr data-job-row="${job.id}" data-search="${attr(`${job.name} ${job.source.url || ''} ${job.target.host || ''} ${job.target.filePath || ''}`.toLowerCase())}">

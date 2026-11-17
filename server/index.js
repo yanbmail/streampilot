@@ -5,12 +5,13 @@ const fs = require('fs');
 const path = require('path');
 const url = require('url');
 const { Store } = require('./config');
-const { jobDefaults, normalizeJob, buildTargetUrl } = require('./config');
+const { jobDefaults, normalizeJob, buildTargetUrl, applyTemplate } = require('./config');
 const { FFmpegService } = require('./ffmpeg');
 const { JobManager } = require('./jobs');
 const { IPTVService } = require('./iptv');
 const { PreviewService, proxyHls, MIME } = require('./preview');
 const { RtmpServer } = require('./rtmp-server');
+const { Scheduler } = require('./scheduler');
 const {
   ensureDir, defaultDataDir, uid, humanBytes, formatDuration, clamp, urlKind,
 } = require('./util');
@@ -83,6 +84,7 @@ async function createApp(options = {}) {
   iptv.load();
   const preview = new PreviewService({ ffmpeg, dataDir, store });
   const rtmp = new RtmpServer();
+  const scheduler = new Scheduler({ store, jobs });
 
   const sseClients = new Set();
   const globalLogs = [];
@@ -125,6 +127,14 @@ async function createApp(options = {}) {
     globalLogs.push({ t: Date.now(), jobId: 'rtmp', level: 'warn', line: `推流结束：${s.app}/${s.name}` });
     try { broadcast('rtmp', await rtmp.status()); } catch (_) {}
   });
+
+  // 排播调度：日志并入全局日志，状态变化实时推给界面
+  scheduler.on('event', (entry) => {
+    globalLogs.push(entry);
+    if (globalLogs.length > 1500) globalLogs.shift();
+    broadcast('log', entry);
+  });
+  scheduler.on('change', (snap) => broadcast('schedule', snap));
 
   // ---------- 进程级兜底 ----------
   // 这是个长时间在跑的推流服务：任何一处漏网的 Promise 拒绝或异常都不该让整个进程退出，
@@ -186,6 +196,8 @@ async function createApp(options = {}) {
     runtime: jobs.snapshot(),
     system: systemInfo(),
     template: jobDefaults(),
+    schedule: scheduler.snapshot(),
+    templates: store.listTemplates(),
     iptv: { ...iptv.stats(), catalogs: iptv.listCatalogs() },    backups: store.listBackups().slice(0, 20).map((b) => ({
       ...b, human: humanBytes(b.size),
     })),
@@ -440,6 +452,118 @@ async function createApp(options = {}) {
         }
       }
 
+      // ---------- 排播表 ----------
+      if (pathname === '/api/schedule' && req.method === 'GET') {
+        return sendJson(res, 200, { ok: true, ...scheduler.snapshot(), agenda: scheduler.agenda(7) });
+      }
+      if (pathname === '/api/schedule' && req.method === 'POST') {
+        const body = await readBody(req);
+        const task = store.upsertScheduleTask(body);
+        const snap = scheduler.snapshot();
+        broadcast('schedule', snap);
+        return sendJson(res, 200, { ok: true, task, ...snap });
+      }
+      if (pathname === '/api/schedule/toggle' && req.method === 'POST') {
+        const body = await readBody(req).catch(() => ({}));
+        const enabled = store.setScheduleEnabled(body.enabled !== false);
+        const snap = scheduler.snapshot();
+        broadcast('schedule', snap);
+        return sendJson(res, 200, { ok: true, enabled, ...snap });
+      }
+      if (pathname === '/api/schedule/tick' && req.method === 'POST') {
+        await scheduler.tick();
+        return sendJson(res, 200, { ok: true, ...scheduler.snapshot() });
+      }
+      const schMatch = /^\/api\/schedule\/([\w-]+)(\/[a-z-]+)?$/.exec(pathname);
+      if (schMatch) {
+        const id = schMatch[1];
+        const action = schMatch[2] || '';
+        const task = store.getScheduleTask(id);
+        if (!task) return sendJson(res, 404, { ok: false, error: '排播不存在' });
+        if (req.method === 'PATCH' && !action) {
+          const body = await readBody(req);
+          const updated = store.upsertScheduleTask({ ...body, id });
+          const snap = scheduler.snapshot();
+          broadcast('schedule', snap);
+          return sendJson(res, 200, { ok: true, task: updated, ...snap });
+        }
+        if (req.method === 'DELETE' && !action) {
+          scheduler.forget(id);
+          store.removeScheduleTask(id);
+          const snap = scheduler.snapshot();
+          broadcast('schedule', snap);
+          return sendJson(res, 200, { ok: true, ...snap });
+        }
+        if (req.method === 'POST' && action === '/run') {
+          const body = await readBody(req).catch(() => ({}));
+          const snap = await scheduler.runNow(id, body.minutes || task.durationMin || 60);
+          broadcast('schedule', snap);
+          return sendJson(res, 200, { ok: true, ...snap });
+        }
+        if (req.method === 'POST' && action === '/stop') {
+          const snap = await scheduler.stopNow(id);
+          broadcast('schedule', snap);
+          return sendJson(res, 200, { ok: true, ...snap });
+        }
+      }
+
+      // ---------- 推流模板 ----------
+      if (pathname === '/api/templates' && req.method === 'GET') {
+        return sendJson(res, 200, { ok: true, templates: store.listTemplates() });
+      }
+      if (pathname === '/api/templates' && req.method === 'POST') {
+        const body = await readBody(req);
+        const src = body.from ? store.getJob(String(body.from)) : body;
+        if (!src) return sendJson(res, 404, { ok: false, error: '来源任务不存在' });
+        const tpl = store.upsertTemplate({
+          ...src,
+          id: body.id || '',
+          name: body.name || `${src.name || '推流'} 模板`,
+          desc: body.desc !== undefined ? body.desc : (src.note || ''),
+          icon: body.icon || '',
+        });
+        return sendJson(res, 200, { ok: true, template: tpl, templates: store.listTemplates() });
+      }
+      const tplMatch = /^\/api\/templates\/([\w-]+)(\/[a-z-]+)?$/.exec(pathname);
+      if (tplMatch) {
+        const id = tplMatch[1];
+        const action = tplMatch[2] || '';
+        const tpl = store.getTemplate(id);
+        if (!tpl) return sendJson(res, 404, { ok: false, error: '模板不存在' });
+        if (req.method === 'PATCH' && !action) {
+          const body = await readBody(req);
+          const updated = store.upsertTemplate({ ...tpl, ...body, id });
+          return sendJson(res, 200, { ok: true, template: updated, templates: store.listTemplates() });
+        }
+        if (req.method === 'DELETE' && !action) {
+          store.removeTemplate(id);
+          return sendJson(res, 200, { ok: true, templates: store.listTemplates() });
+        }
+        // 套用到一条或多条任务
+        if (req.method === 'POST' && action === '/apply') {
+          const body = await readBody(req).catch(() => ({}));
+          const ids = Array.isArray(body.jobIds) ? body.jobIds : (body.jobId ? [body.jobId] : []);
+          if (!ids.length) return sendJson(res, 400, { ok: false, error: '请选择要套用的任务' });
+          const results = [];
+          for (const jid of ids) {
+            const job = store.getJob(jid);
+            if (!job) { results.push({ jobId: jid, ok: false, error: '任务不存在' }); continue; }
+            const next = applyTemplate(job, tpl);
+            store.upsertJob({ ...next, id: jid });
+            results.push({ jobId: jid, ok: true, name: job.name });
+          }
+          const okCount = results.filter((r) => r.ok).length;
+          return sendJson(res, 200, { ok: true, applied: okCount, results, jobs: store.config.jobs });
+        }
+        // 用模板直接建一条新任务
+        if (req.method === 'POST' && action === '/new-job') {
+          const body = await readBody(req).catch(() => ({}));
+          const base = normalizeJob({ name: body.name || `${tpl.name} 任务`, source: body.source || { type: 'test' } }, null);
+          const job = store.upsertJob({ ...applyTemplate(base, tpl), name: body.name || `${tpl.name} 任务`, id: '' });
+          return sendJson(res, 200, { ok: true, job });
+        }
+      }
+
       // ---------- 电视源 ----------
       if (pathname === '/api/catalogs' && req.method === 'GET') {
         return sendJson(res, 200, { ok: true, catalogs: iptv.listCatalogs(), recommended: iptv.stats().recommended });
@@ -682,7 +806,7 @@ async function createApp(options = {}) {
   server.keepAliveTimeout = 65000;
 
   return {
-    server, store, ffmpeg, jobs, iptv, preview, rtmp, dataDir, systemInfo,
+    server, store, ffmpeg, jobs, iptv, preview, rtmp, scheduler, dataDir, systemInfo,
     async listen(port = store.config.settings.http?.port || 8377, host) {
       const allowLan = Boolean(store.config.settings.http?.allowLan);
       const bindHost = host || (allowLan ? '0.0.0.0' : '127.0.0.1');
@@ -698,6 +822,7 @@ async function createApp(options = {}) {
       store.saveNow();
       jobs.autoStartAll().catch(() => {});
       iptv.autoRefreshIfStale().catch(() => {});
+      scheduler.start();
       // 上次退出前开着的收流服务，这次启动自动恢复
       const rc = store.config.settings.rtmpServer;
       if (rc && rc.enabled) {
@@ -708,6 +833,7 @@ async function createApp(options = {}) {
     },
     async close() {
       clearInterval(statsTimer);
+      scheduler.stop();
       preview.stopAll();
       try { rtmp.stop(); } catch (_) {}
       await jobs.stopAll();

@@ -85,6 +85,34 @@ npm run dist:linux   # AppImage + deb
 
 打包产物不要提交（`.gitignore` 已排除 `release/`），要分发就上传到 GitHub Releases。
 
+## 五之二、发布一个新版本（打 tag + 写版本说明）
+
+版本号在三个地方保持一致：`package.json` 的 `version`、`web/index.html` 里的版本号、git tag。
+
+```bash
+cd /Users/yanbin/WorkBuddy/2026-11-17-07-53-43/streampilot
+
+# 1. 改版本号（三处）
+#    package.json  -> "version": "1.2.0"
+#    web/index.html -> 侧栏/标题里的 v1.2.0
+
+# 2. 提交并推送
+git add -A
+git commit -m "feat: 多码率阶梯转码 / 排播表 / 推流模板（v1.2.0）"
+git push
+
+# 3. 打标签并推送
+git tag -a v1.2.0 -m "v1.2.0 阶梯转码 + 排播表 + 推流模板"
+git push origin v1.2.0
+
+# 4. 创建 Release（有 gh 命令时）
+gh release create v1.2.0 --title "v1.2.0 · 多码率阶梯转码 / 一周排播 / 推流模板" --notes-file docs/release-notes.md
+```
+
+没有 `gh` 也可以网页操作：仓库 → Releases → Draft a new release → 选 tag → 粘贴说明。
+
+版本说明建议按「新增 / 修复 / 升级提示」三段写，写清有没有配置结构变化。
+
 ## 六、建议先看一遍再公开的内容
 
 - `package.json` 里的 `author`，可改成你的名字/ID

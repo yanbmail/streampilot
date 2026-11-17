@@ -13,6 +13,8 @@
     iptv: { total: 0, groups: [], catalogs: [], recommended: [] },
     backups: [], template: {},
     rtmp: { available: true, running: false, port: 1935, httpPort: 8399, streams: [] },
+    schedule: { enabled: true, tasks: [] },
+    templates: [],
   };
   SP.logBuffer = [];
   SP.series = new Map();
@@ -23,6 +25,8 @@
   const PAGES = {
     dashboard: { title: '总览', sub: '全局推流状态与实时指标', render: () => SP.views.dashboard() },
     streams: { title: '推流任务', sub: '管理每条推流链路的输入、编码与输出', render: () => SP.views.streams() },
+    schedule: { title: '排播表', sub: '一周定时排播：到点自动开播、到点自动停', render: () => SP.schedule.page() },
+    templates: { title: '推流模板', sub: '把一套码率 / 分辨率 / 目标存成模板，一键复用', render: () => SP.templates.page() },
     sources: { title: '电视源', sub: '聚合公开 IPTV 源，支持在线播放与一键转推', render: () => SP.tv.sources() },
     player: { title: '播放器', sub: '播放电视源、网络流与本地媒体', render: () => SP.tv.playerView() },
     logs: { title: '运行日志', sub: 'FFmpeg 实时输出与错误诊断', render: () => SP.views.logs() },
@@ -40,6 +44,8 @@
     SP.state.backups = s.backups || [];
     SP.state.template = s.template || {};
     SP.state.rtmp = s.rtmp || SP.state.rtmp;
+    SP.state.schedule = s.schedule || SP.state.schedule;
+    SP.state.templates = s.templates || SP.state.templates;
     for (const [jobId, r] of Object.entries(s.runtime || {})) {
       if (typeof r.bitrateKbps === 'number' && r.status === 'running') pushSeries(jobId, r.bitrateKbps);
     }
@@ -69,6 +75,12 @@
     if (nr) { nr.textContent = running ? String(running) : ''; nr.classList.toggle('hot', running > 0); }
     const nc = document.getElementById('nav-channels');
     if (nc) nc.textContent = SP.state.iptv.total ? String(SP.state.iptv.total) : '';
+    const ns = document.getElementById('nav-schedule');
+    if (ns) {
+      const n = (SP.state.schedule?.tasks || []).filter((t) => t.running).length;
+      ns.textContent = n ? String(n) : '';
+      ns.classList.toggle('hot', n > 0);
+    }
     const pill = document.getElementById('sys-pill');
     if (pill) {
       const ff = SP.state.system.ffmpeg || {};
@@ -120,6 +132,11 @@
       buttons.push(`<button class="btn btn-sm" data-act="go" data-to="sources">${icon('tv', 13)} 电视源</button>`);
     } else if (page === 'logs') {
       buttons.push(`<button class="btn btn-sm" data-act="refresh">${icon('refresh', 13)} 刷新</button>`);
+    } else if (page === 'schedule') {
+      buttons.push(`<button class="btn btn-sm" data-act="refresh">${icon('refresh', 13)} 刷新</button>`);
+    } else if (page === 'templates') {
+      buttons.push(`<button class="btn btn-sm" data-act="tpl-save-from-job">${icon('save', 13)} 从任务保存</button>`);
+      buttons.push(`<button class="btn btn-sm btn-primary" data-act="tpl-new-blank">${icon('plus', 13)} 新建模板</button>`);
     } else if (page === 'settings') {
       buttons.push(`<button class="btn btn-sm btn-primary" data-act="save-settings">${icon('save', 13)} 保存设置</button>`);
     } else {
@@ -305,6 +322,46 @@
             location.hash = '#/streams';
             break;
           }
+
+          /* ---------- 排播表 ---------- */
+          case 'schedule-new': SP.schedule.openEditor(null); break;
+          case 'schedule-edit': {
+            const t = (SP.state.schedule.tasks || []).find((x) => x.id === id);
+            if (t) SP.schedule.openEditor(t);
+            break;
+          }
+          case 'schedule-run': await SP.schedule.runNow(id); break;
+          case 'schedule-stop': {
+            await api.stopSchedule(id);
+            toast('已停止播送', 'ok');
+            await SP.refreshState({ silent: true });
+            SP.render({ keepScroll: true });
+            break;
+          }
+          case 'schedule-toggle': {
+            await api.updateSchedule(id, { enabled: el.dataset.on === '1' });
+            toast(el.dataset.on === '1' ? '已启用这条排播' : '已停用这条排播', 'ok', 1800);
+            await SP.refreshState({ silent: true });
+            SP.render({ keepScroll: true });
+            break;
+          }
+          case 'schedule-delete': await SP.schedule.remove(id); break;
+          case 'schedule-now-tick': {
+            await api.tickSchedule();
+            await SP.refreshState({ silent: true });
+            SP.render({ keepScroll: true });
+            toast('已按当前时间检查一遍排播', 'ok', 2000);
+            break;
+          }
+
+          /* ---------- 推流模板 ---------- */
+          case 'tpl-save-from-job': SP.templates.openSave({ onSaved: () => SP.refreshState() }); break;
+          case 'tpl-new-blank': SP.templates.openBlank(); break;
+          case 'tpl-use': await SP.templates.useTemplate(id); break;
+          case 'tpl-apply-one': SP.templates.openApply(id); break;
+          case 'tpl-rename': SP.templates.openRename(id); break;
+          case 'tpl-duplicate': await SP.templates.duplicate(id); break;
+          case 'tpl-delete': await SP.templates.remove(id); break;
 
           /* ---------- 电视源 ---------- */
           case 'catalog-add': openAddCatalog(); break;
@@ -614,6 +671,10 @@
       } else if (event === 'rtmp') {
         SP.state.rtmp = { ...(SP.state.rtmp || {}), ...data };
         if (SP.page === 'settings') SP.render({ keepScroll: true });
+      } else if (event === 'schedule') {
+        SP.state.schedule = data;
+        const noModal = !document.getElementById('modal-root')?.children.length;
+        if (SP.page === 'schedule' && noModal) SP.render({ keepScroll: true });
       } else if (event === 'iptv') {
         SP.state.iptv = { ...SP.state.iptv, ...data };
         updateShellBadges();

@@ -49,20 +49,24 @@ class JobManager extends EventEmitter {
    */
   startOutputMeter(job, rt) {
     const t = job.target || {};
+    const ladderOn = this.ffmpeg.ladderActive(job);
+    const hlsRung = ladderOn ? (job.ladder.rungs || []).find((r) => (r.target || {}).protocol === 'hls') : null;
+    const hlsDir = ladderOn
+      ? (hlsRung ? path.join(this.hlsRoot, `${job.id}_${hlsRung.id}`) : '')
+      : (t.protocol === 'hls' ? path.join(this.hlsRoot, job.id) : '');
     let probe = null;
 
-    if (t.protocol === 'hls') {
-      const dir = path.join(this.hlsRoot, job.id);
+    if (hlsDir) {
       const segSec = Math.max(1, Number(t.hlsSegmentSeconds) || 2);
       probe = () => {
         let total = 0;
         let newest = 0;
         let newestMtime = 0;
         try {
-          for (const f of fs.readdirSync(dir)) {
+          for (const f of fs.readdirSync(hlsDir)) {
             if (!/\.(ts|m4s|mp4|m4v)$/i.test(f)) continue;
             try {
-              const st = fs.statSync(path.join(dir, f));
+              const st = fs.statSync(path.join(hlsDir, f));
               total += st.size;
               if (st.mtimeMs > newestMtime) { newestMtime = st.mtimeMs; newest = st.size; }
             } catch (_) {}
@@ -70,12 +74,12 @@ class JobManager extends EventEmitter {
         } catch (_) {}
         return { bytes: total, kbps: Math.round((newest * 8) / segSec / 1000) };
       };
-    } else if (t.protocol === 'file' && t.filePath) {
+    } else if (t.protocol === 'file' && t.filePath && !ladderOn) {
       probe = () => {
         try { return { bytes: fs.statSync(t.filePath).size }; } catch (_) { return { bytes: 0 }; }
       };
     } else if (job.record && job.record.enabled && job.record.filePath) {
-      // 多路分发（tee）时 ffmpeg 不报总字节数，用同步录制的文件体积推算实际码流
+      // 多路分发（tee）/ 阶梯转码时 ffmpeg 不报总字节数，用同步录制的文件体积推算实际码流
       const recPath = job.record.filePath;
       probe = () => {
         try { return { bytes: fs.statSync(recPath).size }; } catch (_) { return { bytes: 0 }; }
@@ -131,6 +135,7 @@ class JobManager extends EventEmitter {
         restarts: hist.restarts, lastError: last.lastError || '',
         outputUrl: last.outputUrl || '', command: last.command || '',
         health: last.status === 'error' ? 'bad' : null,
+        rungs: this.rungUrls(this.store.getJob(jobId) || {}),
       };
     }
     return {
@@ -153,6 +158,7 @@ class JobManager extends EventEmitter {
       health: rt.health,
       recordPath: (this.store.getJob(jobId)?.record || {}).enabled
         ? (this.store.getJob(jobId)?.record || {}).filePath : '',
+      rungs: this.rungUrls(this.store.getJob(jobId) || {}),
     };
   }
 
@@ -161,17 +167,42 @@ class JobManager extends EventEmitter {
     const warnings = [];
     const target = buildTargetUrl(job.target);
     const t = job.target;
+    const ladderOn = this.ffmpeg.ladderActive(job);
 
-    if (['rtmp', 'rtmps', 'rtsp', 'srt', 'udp'].includes(t.protocol) && !t.url) {
-      if (!t.host) throw new Error('请填写推流服务器地址');
-      if (!t.streamKey && !t.app) throw new Error('请填写推流码 / 流名称');
-    }
-    if (t.protocol === 'hls') {
-      ensureDir(path.join(this.hlsRoot, job.id));
-    }
-    if (t.protocol === 'file') {
-      if (!t.filePath) throw new Error('请选择录制文件保存路径');
-      ensureDir(path.dirname(t.filePath));
+    if (ladderOn) {
+      // 阶梯转码下主目标不参与输出，逐个校验每一档的目标
+      (job.ladder.rungs || []).forEach((r, i) => {
+        const rt = r.target || {};
+        const label = `第 ${i + 1} 档（${r.name}）`;
+        if (['rtmp', 'rtmps', 'rtsp', 'srt', 'udp'].includes(rt.protocol)) {
+          if (!rt.url && !rt.host) throw new Error(`${label}还没填推流服务器地址`);
+          if (!rt.url && !rt.streamKey && !rt.app) throw new Error(`${label}还没填推流码 / 流名称`);
+        }
+        if (rt.protocol === 'hls') ensureDir(path.join(this.hlsRoot, `${job.id}_${r.id}`));
+        if (rt.protocol === 'file') {
+          if (!rt.filePath) throw new Error(`${label}还没选择保存路径`);
+          ensureDir(path.dirname(rt.filePath));
+        }
+        if (rt.protocol === 'flv') throw new Error(`${label}不支持 HTTP-FLV 监听模式，请换成 RTMP / SRT`);
+      });
+      const seen = new Set();
+      (job.ladder.rungs || []).forEach((r, i) => {
+        const key = buildTargetUrl(r.target).url;
+        if (key && seen.has(key)) warnings.push(`第 ${i + 1} 档与其他档的目标地址相同，可能会互相覆盖`);
+        if (key) seen.add(key);
+      });
+    } else {
+      if (['rtmp', 'rtmps', 'rtsp', 'srt', 'udp'].includes(t.protocol) && !t.url) {
+        if (!t.host) throw new Error('请填写推流服务器地址');
+        if (!t.streamKey && !t.app) throw new Error('请填写推流码 / 流名称');
+      }
+      if (t.protocol === 'hls') {
+        ensureDir(path.join(this.hlsRoot, job.id));
+      }
+      if (t.protocol === 'file') {
+        if (!t.filePath) throw new Error('请选择录制文件保存路径');
+        ensureDir(path.dirname(t.filePath));
+      }
     }
     if (job.source.type === 'file' && !fs.existsSync(job.source.path)) {
       throw new Error(`媒体文件不存在：${job.source.path}`);
@@ -183,13 +214,15 @@ class JobManager extends EventEmitter {
     }
     if (job.source.type === 'url' && !job.source.url) throw new Error('请填写输入流地址');
 
-    // 附加分发目标校验
+    // 附加分发目标校验（阶梯模式下各档自带目标，附加目标不参与输出）
     const extras = job.targets || [];
-    extras.forEach((e, i) => {
-      if (e.url) return;
-      if (!e.host) throw new Error(`第 ${i + 1} 个附加目标缺少服务器地址`);
-      if (!e.streamKey) throw new Error(`第 ${i + 1} 个附加目标缺少推流码 / 流名称`);
-    });
+    if (!ladderOn) {
+      extras.forEach((e, i) => {
+        if (e.url) return;
+        if (!e.host) throw new Error(`第 ${i + 1} 个附加目标缺少服务器地址`);
+        if (!e.streamKey) throw new Error(`第 ${i + 1} 个附加目标缺少推流码 / 流名称`);
+      });
+    }
 
     // 同步录制：没填路径就自动落到数据目录
     const rec = job.record || {};
@@ -212,8 +245,13 @@ class JobManager extends EventEmitter {
     if (job.video.mode === 'copy' && job.target.protocol === 'rtmp' && job.video.codec === 'hevc') {
       warnings.push('RTMP 标准协议不支持 HEVC 直通，建议改用 RTMP(S) + H.264 或 SRT');
     }
-    if (job.video.bitrateKbps > 12000 && job.video.height >= 2160) {
+    if (!ladderOn && job.video.bitrateKbps > 12000 && job.video.height >= 2160) {
       warnings.push('4K 高码率对上行带宽要求较高，建议先测速');
+    }
+    if (ladderOn) {
+      const totalKbps = (job.ladder.rungs || []).reduce((a, r) => a + (r.bitrateKbps || 0), 0);
+      const encCount = (job.ladder.rungs || []).length;
+      warnings.push(`阶梯转码共 ${encCount} 档，合计约 ${(totalKbps / 1000).toFixed(1)} Mbps 编码负载，CPU 占用会比单路高`);
     }
     const caps = this.ffmpeg.caps;
     if (caps && t.protocol === 'srt' && !caps.protocols.includes('srt')) {
@@ -221,14 +259,34 @@ class JobManager extends EventEmitter {
     }
 
     let outputUrl = '';
-    if (t.protocol === 'hls') outputUrl = `/hls/${job.id}/index.m3u8`;
-    if (t.protocol === 'flv') {
+    if (ladderOn) {
+      // 本地 HLS 档位可直接给出播放地址，方便自测
+      const hlsRung = (job.ladder.rungs || []).find((r) => r.protocol === 'hls' || (r.target || {}).protocol === 'hls');
+      if (hlsRung) outputUrl = `/hls/${job.id}_${hlsRung.id}/index.m3u8`;
+    } else if (t.protocol === 'hls') {
+      outputUrl = `/hls/${job.id}/index.m3u8`;
+    }
+    if (!ladderOn && t.protocol === 'flv') {
       const ips = this.ffmpeg.localAddresses();
       const ip = ips[0]?.address || '127.0.0.1';
       outputUrl = `http://${ip}:${t.flvListenPort}/live.flv`;
     }
 
-    return { target, concatFile, warnings, outputUrl };
+    return { target, concatFile, warnings, outputUrl, ladderOn, rungUrls: this.rungUrls(job) };
+  }
+
+  /** 每一档实际会推往的地址，供界面展示与排查 */
+  rungUrls(job) {
+    if (!this.ffmpeg.ladderActive(job)) return [];
+    return (job.ladder.rungs || []).map((r) => ({
+      id: r.id,
+      name: r.name,
+      width: r.width,
+      height: r.height,
+      bitrateKbps: r.bitrateKbps,
+      protocol: r.target?.protocol || 'rtmp',
+      url: buildTargetUrl(r.target || {}).url || '',
+    }));
   }
 
   async start(jobId, { manual = true } = {}) {
@@ -267,11 +325,18 @@ class JobManager extends EventEmitter {
     const extraCount = (job.targets || []).filter((x) => x.url || x.host).length;
     const recOn = Boolean(job.record && job.record.enabled && job.record.filePath);
     const fanCount = extraCount + (recOn ? 1 : 0);
-    this.log(jobId, `启动推流 → ${prep.target.url || '(本地 HLS)'}${fanCount ? `（同一份编码分发 ${fanCount + 1} 路）` : ''}`);
-    if (recOn) this.log(jobId, `同步录制 → ${job.record.filePath}`, 'ok');
-    if (extraCount) {
-      this.log(jobId, `附加目标：${(job.targets || []).filter((x) => x.url || x.host)
-        .map((x) => `${x.protocol}://${x.host || '-'}/${[x.app, x.streamKey].filter(Boolean).join('/')}`).join(' , ')}`);
+    if (prep.ladderOn) {
+      const urls = prep.rungUrls;
+      this.log(jobId, `启动阶梯转码 → 一次解码输出 ${urls.length} 档`, 'ok');
+      urls.forEach((r) => this.log(jobId, `  ${r.name} ${r.width}×${r.height} ${r.bitrateKbps}kbps → ${r.url || '(未设置)'}`));
+      if (recOn) this.log(jobId, `同步录制（跟随第 1 档）→ ${job.record.filePath}`, 'ok');
+    } else {
+      this.log(jobId, `启动推流 → ${prep.target.url || '(本地 HLS)'}${fanCount ? `（同一份编码分发 ${fanCount + 1} 路）` : ''}`);
+      if (recOn) this.log(jobId, `同步录制 → ${job.record.filePath}`, 'ok');
+      if (extraCount) {
+        this.log(jobId, `附加目标：${(job.targets || []).filter((x) => x.url || x.host)
+          .map((x) => `${x.protocol}://${x.host || '-'}/${[x.app, x.streamKey].filter(Boolean).join('/')}`).join(' , ')}`);
+      }
     }
     this.emit('state', { jobId, status: 'starting' });
 
