@@ -202,9 +202,19 @@ async function proxyHls(url, { userAgent, referer } = {}) {
       },
     });
     if (!res.ok) throw new Error(`源站返回 HTTP ${res.status}`);
-    const text = await res.text();
     const base = res.url || url;
-    if (!/^#EXTM3U/i.test(text.trim())) return { playlist: false, res };
+    const ctype = (res.headers.get('content-type') || '').toLowerCase();
+    // 明显是音视频流的内容不要当播放列表去读，直接原样转发，避免把二进制当文本吞掉
+    if (/^(video|audio)\//.test(ctype) || ctype.includes('flv')) {
+      return { playlist: false, res, contentType: ctype };
+    }
+    // 一次性读成 Buffer：判定不是播放列表时可以把原始字节原样交回去，
+    // 否则 body 被 text() 消费完后再去 pipe 只会得到空响应
+    const raw = Buffer.from(await res.arrayBuffer());
+    const text = raw.toString('utf8');
+    if (!/^#EXTM3U/i.test(text.trim())) {
+      return { playlist: false, res, raw, contentType: ctype || 'application/octet-stream' };
+    }
     const lines = text.split(/\r?\n/);
     const out = lines.map((line) => {
       const l = line.trim();

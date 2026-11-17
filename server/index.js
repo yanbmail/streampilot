@@ -119,12 +119,29 @@ async function createApp(options = {}) {
 
   rtmp.on('publish', async (s) => {
     globalLogs.push({ t: Date.now(), jobId: 'rtmp', level: 'ok', line: `收到推流：${s.app}/${s.name}` });
-    broadcast('rtmp', await rtmp.status());
+    try { broadcast('rtmp', await rtmp.status()); } catch (_) {}
   });
   rtmp.on('unpublish', async (s) => {
     globalLogs.push({ t: Date.now(), jobId: 'rtmp', level: 'warn', line: `推流结束：${s.app}/${s.name}` });
-    broadcast('rtmp', await rtmp.status());
+    try { broadcast('rtmp', await rtmp.status()); } catch (_) {}
   });
+
+  // ---------- 进程级兜底 ----------
+  // 这是个长时间在跑的推流服务：任何一处漏网的 Promise 拒绝或异常都不该让整个进程退出，
+  // 否则一次拉流超时 / 一条直播流断开就会把正在推的所有任务一起带崩。
+  if (!global.__spGuards) {
+    global.__spGuards = true;
+    const report = (kind, err) => {
+      const detail = (err && (err.stack || err.message)) || String(err);
+      console.error(`[${kind}]`, detail);
+      const line = `${kind}：${(err && err.message) || String(err)}`;
+      globalLogs.push({ t: Date.now(), jobId: 'system', level: 'error', line });
+      if (globalLogs.length > 1500) globalLogs.shift();
+      broadcast('log', { t: Date.now(), jobId: 'system', level: 'error', line });
+    };
+    process.on('unhandledRejection', (err) => report('未处理的 Promise 拒绝', err));
+    process.on('uncaughtException', (err) => report('未捕获异常', err));
+  }
 
   // 系统信息
   const systemInfo = () => ({
@@ -588,7 +605,7 @@ async function createApp(options = {}) {
         const kind = urlKind(target);
         try {
           if (kind === 'hls') {
-            const { playlist, body, res: upstream } = await proxyHls(target, {
+            const { playlist, body, res: upstream, raw, contentType } = await proxyHls(target, {
               userAgent: query.ua || store.config.settings.player.userAgent,
               referer: query.ref || store.config.settings.player.referer,
             });
@@ -599,6 +616,15 @@ async function createApp(options = {}) {
                 'Access-Control-Allow-Origin': '*',
               });
               return res.end(body);
+            }
+            if (raw) {
+              res.writeHead(upstream.status, {
+                'Content-Type': contentType,
+                'Content-Length': raw.length,
+                'Cache-Control': 'no-store',
+                'Access-Control-Allow-Origin': '*',
+              });
+              return res.end(raw);
             }
             return pipeUpstream(upstream, res, req);
           }
@@ -707,20 +733,44 @@ async function pipeUpstream(upstream, res, req) {
   if (range) headers['Content-Range'] = range;
   res.writeHead(upstream.status, headers);
   if (!upstream.body) return res.end();
+
   const reader = upstream.body.getReader();
   let closed = false;
-  req.on('close', () => { closed = true; try { reader.cancel(); } catch (_) {} });
+  let wakeup = null;
+
+  // 关键：reader.cancel() / body.cancel() 返回的 Promise 在上游流已被终止（超时、
+  // 客户端断开）时一定会 reject。不去 catch 就会变成未处理的 Promise 拒绝，
+  // Node 默认把它当致命错误直接杀掉整个进程 —— 一条 FLV 直播流断开就能拖垮全部推流任务。
+  const cleanup = () => {
+    if (closed) return;
+    closed = true;
+    try { Promise.resolve(reader.cancel()).catch(() => {}); } catch (_) {}
+    try { Promise.resolve(upstream.body.cancel()).catch(() => {}); } catch (_) {}
+    if (wakeup) { const fn = wakeup; wakeup = null; try { fn(); } catch (_) {} }
+  };
+
+  req.on('close', cleanup);
+  res.on('close', cleanup);
+  res.on('error', cleanup);
+
   try {
     while (!closed) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done || closed) break;
       if (!res.write(Buffer.from(value))) {
-        await new Promise((r) => res.once('drain', r));
+        // 客户端读得慢就等着；同时监听 close，避免永远挂在这里
+        await new Promise((resolve) => {
+          wakeup = resolve;
+          res.once('drain', resolve);
+          res.once('close', resolve);
+        });
+        wakeup = null;
       }
     }
   } catch (_) {
-    // 客户端主动断开是常态
+    // 客户端主动断开、上游空闲超时断开，都是直播反代的常态
   } finally {
+    cleanup();
     try { res.end(); } catch (_) {}
   }
 }
@@ -744,7 +794,10 @@ function serveFile(res, file, pathname, fallbackIndex = false) {
       'Cache-Control': ext === '.html' || ext === '.js' || ext === '.css' ? 'no-cache' : 'public, max-age=60',
       'Access-Control-Allow-Origin': '*',
     });
-    fs.createReadStream(file).pipe(res);
+    const stream = fs.createReadStream(file);
+    stream.on('error', () => { try { res.destroy(); } catch (_) {} });
+    res.on('close', () => { try { stream.destroy(); } catch (_) {} });
+    stream.pipe(res);
   } catch (err) {
     res.writeHead(500);
     res.end(err.message);

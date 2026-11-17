@@ -1,7 +1,7 @@
 {
   "name": "streampilot",
   "productName": "StreamPilot",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "跨平台推流控制台：多协议推流、屏幕区域采集、IPTV 电视源聚合与转推",
   "author": "yanbmail",
   "license": "MIT",

@@ -216,6 +216,12 @@ function parsePlaylist(text, url = '') {
   return [];
 }
 
+/** 丢弃响应体：只探测响应头的场景必须显式释放连接，否则 undici 会一直挂着并在超时后抛出无人接收的错误 */
+function upstreamBodyDrain(res) {
+  if (!res || !res.body) return;
+  try { Promise.resolve(res.body.cancel()).catch(() => {}); } catch (_) {}
+}
+
 async function fetchText(url, { timeout = 45000, userAgent, headers } = {}) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeout);
@@ -512,7 +518,9 @@ class IPTVService extends EventEmitter {
             });
             ok = res.ok || res.status === 206;
             if (!ok) note = `HTTP ${res.status}`;
-            try { ctrl.abort(); } catch (_) {}
+            // 只探测响应头，必须把 body 显式丢弃：不消费也不 cancel 的话，
+            // 连接对象会被 undici 当成挂起请求，超时后抛出的 terminated 错误没人接，能直接崩掉进程
+            try { upstreamBodyDrain(res); } catch (_) {}
           } else {
             ok = true;
             note = '非 HTTP 协议，未做在线检测';
