@@ -143,10 +143,15 @@ SP.jobForm = (() => {
         <div class="spacer"></div>
         <span class="dim small" id="jf-tpl-hint">${(SP.templates.list() || []).length} 套可用</span>
       </div>
+      <div class="jf-namebar">
+        <span class="dim small">任务名称</span>
+        <input class="input" id="jf-name" data-k="name" value="${attr(draft.name || '')}" placeholder="给这条推流起个名字，例如：客厅摄像头 · 视频号直播" />
+      </div>
       <div class="tabs" id="jf-tabs">
         ${TABS.map((t) => `<button type="button" data-tab="${t.id}" class="${t.id === activeTab ? 'active' : ''}">${icon(t.icon, 13)} ${t.label}</button>`).join('')}
       </div>
       <div class="modal-body" id="jf-body"></div>
+      <div class="jf-error" id="jf-error" hidden></div>
       <div class="modal-foot">
         ${!isNew ? `<button class="btn btn-ghost" id="jf-del" style="color:#ff8b95">${icon('trash', 14)} 删除</button>` : ''}
         <button class="btn btn-ghost" id="jf-cmd">${icon('terminal', 14)} 命令预览</button>
@@ -160,8 +165,17 @@ SP.jobForm = (() => {
     const root = entry.el;
 
     root.querySelector('#jf-autostart').addEventListener('change', (e) => { draft.autoStart = e.target.checked; });
+    const nameInput = root.querySelector('#jf-name');
+    if (nameInput) {
+      nameInput.addEventListener('input', () => {
+        draft.name = nameInput.value;
+        if (nameInput.value.trim()) clearFormError();
+      });
+      nameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') nameInput.blur(); });
+    }
     root.querySelectorAll('[data-tab]').forEach((b) => b.addEventListener('click', () => {
       activeTab = b.dataset.tab;
+      clearFormError();
       root.querySelectorAll('[data-tab]').forEach((x) => x.classList.toggle('active', x.dataset.tab === activeTab));
       renderTab();
     }));
@@ -203,6 +217,7 @@ SP.jobForm = (() => {
         let val = isCheck ? inp.checked : inp.value;
         if (inp.dataset.type === 'num') val = val === '' ? 0 : Number(val);
         setPath(draft, k, val);
+        clearFormError();
         if (inp.dataset.rerender) renderTab();
         else updateFooterHint();
       });
@@ -213,6 +228,7 @@ SP.jobForm = (() => {
         if (btn.dataset.type === 'num') val = Number(val);
         const prev = getPath(draft, btn.dataset.set);
         setPath(draft, btn.dataset.set, val);
+        clearFormError();
         // 切换推流协议时端口归零，避免沿用上一个协议的端口
         if (btn.dataset.set === 'target.protocol' && prev !== val && draft.target) draft.target.port = 0;
         if (btn.dataset.re) renderTab();
@@ -230,6 +246,22 @@ SP.jobForm = (() => {
 
   async function localAction(action, ds) {
     try {
+      if (action === 'test-camera') {
+        const cfg = draft.source.camera || {};
+        const dev = cfg.videoDevice;
+        if (!String(dev ?? '').length) return showFormError('请先选择摄像头设备，再点「检测」', 'source');
+        clearFormError();
+        const btn = entry?.el.querySelector('[data-local="test-camera"]');
+        const old = btn ? btn.innerHTML : '';
+        if (btn) { btn.disabled = true; btn.textContent = '检测中…'; }
+        try {
+          const r = await api.deviceTest({ type: 'camera', videoDevice: dev, audioDevice: cfg.audioDevice });
+          if (r.ok) toast('摄像头可用：已成功抓到一帧画面', 'ok', 3000);
+          else showFormError(`摄像头打不开 —— ${r.error}`, 'source');
+        } finally {
+          if (btn) { btn.disabled = false; btn.innerHTML = old; }
+        }
+      }
       if (action === 'pick-file') {
         const r = await api.pickFiles(false, 'media');
         if (r.ok && r.files?.[0]) { draft.source.path = r.files[0]; renderTab(); }
@@ -559,13 +591,21 @@ SP.jobForm = (() => {
     const c = v('source.camera');
     const vids = devices?.video?.filter((d) => !/capture screen/i.test(d.name)) || [];
     const auds = devices?.audio || [];
+    // 打开就自动选中第一台摄像头，避免「没选设备 → 保存被拦」这种无谓卡点
+    if (!String(c.videoDevice ?? '').length && vids.length) {
+      c.videoDevice = vids[0].id;
+    }
+    const picked = String(c.videoDevice ?? '');
     return `
       ${devices === null ? `<div data-devices-pending class="hint-box" style="margin-bottom:12px">${icon('info')}<div>正在读取摄像头与麦克风…</div></div>` : ''}
       <div class="form-grid">
-        ${field('摄像头', `<select class="select" data-k="source.camera.videoDevice">
-          <option value="">请选择设备</option>
-          ${vids.map((d) => `<option value="${attr(d.id)}" ${String(c.videoDevice) === String(d.id) ? 'selected' : ''}>${h(d.name)}</option>`).join('')}
-        </select>`, vids.length ? '' : '未检测到摄像头，请检查系统权限或连接设备')}
+        ${field('摄像头', `<div class="input-group">
+          <select class="select" data-k="source.camera.videoDevice">
+            <option value="">请选择设备</option>
+            ${vids.map((d) => `<option value="${attr(d.id)}" ${picked === String(d.id) ? 'selected' : ''}>${h(d.name)}</option>`).join('')}
+          </select>
+          <button type="button" class="btn" data-local="test-camera" title="真开一次摄像头抓一帧，确认权限与占用情况">${icon('activity', 14)} 检测</button>
+        </div>`, vids.length ? '枚举正常不代表能打开：点「检测」实抓一帧，权限不足或被占用会直接告诉你' : '未检测到摄像头，请检查系统权限或连接设备')}
         ${field('麦克风', `<select class="select" data-k="source.camera.audioDevice">
           <option value="">不采集声音</option>
           ${auds.map((d) => `<option value="${attr(d.id)}" ${String(c.audioDevice) === String(d.id) ? 'selected' : ''}>${h(d.name)}</option>`).join('')}
@@ -1002,44 +1042,79 @@ SP.jobForm = (() => {
   }
 
   function validate() {
-    if (!String(draft.name || '').trim()) return '请填写任务名称';
+    if (!String(draft.name || '').trim()) return { msg: '请填写任务名称', tab: 'source' };
     const t = draft.source.type;
-    if (t === 'file' && !draft.source.path) return '请选择媒体文件';
-    if (t === 'files' && !(draft.source.paths || []).length) return '请至少添加一个媒体文件';
-    if (t === 'url' && !draft.source.url) return '请填写网络流地址';
-    if (t === 'screen' && devices && devices.screen?.length && draft.source.screen.display === undefined) return '请选择屏幕';
-    const tg = draft.target;
+    if (t === 'file' && !draft.source.path) return { msg: '请选择媒体文件', tab: 'source' };
+    if (t === 'files' && !(draft.source.paths || []).length) return { msg: '请至少添加一个媒体文件', tab: 'source' };
+    if (t === 'url' && !draft.source.url) return { msg: '请填写网络流地址', tab: 'source' };
+    if (t === 'camera' && !String(draft.source.camera?.videoDevice ?? '').length) return { msg: '请选择摄像头设备', tab: 'source' };
+    if (t === 'screen' && devices && devices.screen?.length && draft.source.screen.display === undefined) return { msg: '请选择屏幕', tab: 'source' };
+    const tg = draft.target || {};
     if (draft.ladder && draft.ladder.enabled) {
       const rungs = draft.ladder.rungs || [];
-      if (rungs.length < 2) return '阶梯转码至少要 2 档';
+      if (rungs.length < 2) return { msg: '阶梯转码至少要 2 档', tab: 'target' };
       for (let i = 0; i < rungs.length; i++) {
         const r = rungs[i];
         const rt = r.target || {};
         if (['rtmp', 'rtmps', 'rtsp', 'srt', 'udp'].includes(rt.protocol)) {
-          if (!rt.url && !rt.host) return `第 ${i + 1} 档（${r.name}）还没填服务器地址`;
-          if (!rt.url && !rt.streamKey && !rt.app) return `第 ${i + 1} 档（${r.name}）还没填推流码`;
+          if (!rt.url && !rt.host) return { msg: `第 ${i + 1} 档（${r.name}）还没填服务器地址`, tab: 'target' };
+          if (!rt.url && !rt.streamKey && !rt.app) return { msg: `第 ${i + 1} 档（${r.name}）还没填推流码`, tab: 'target' };
         }
-        if (r.width % 2 || r.height % 2) return `第 ${i + 1} 档分辨率宽高需为偶数（H.264 要求）`;
+        if (r.width % 2 || r.height % 2) return { msg: `第 ${i + 1} 档分辨率宽高需为偶数（H.264 要求）`, tab: 'target' };
       }
     } else {
       if (['rtmp', 'rtmps', 'rtsp', 'srt', 'udp'].includes(tg.protocol)) {
-        if (!tg.url && !tg.host) return '请填写推流服务器地址';
-        if (!tg.url && !tg.streamKey && !tg.app) return '请填写推流码 / 流名称';
+        if (!tg.url && !tg.host) return { msg: '还没有填推流服务器地址：到「推流目标」填地址和推流码；只想先录制可以切换成「录制文件」', tab: 'target' };
+        if (!tg.url && !tg.streamKey && !tg.app) return { msg: '还没有填推流码 / 流名称', tab: 'target' };
       }
-      if (tg.protocol === 'file' && !tg.filePath) return '请选择录制文件保存路径';
+      if (tg.protocol === 'file' && !tg.filePath) return { msg: '请选择录制文件保存路径', tab: 'target' };
     }
     if (draft.video.mode === 'transcode') {
-      if (!(draft.video.width > 0) || !(draft.video.height > 0)) return '输出分辨率不正确';
-      if (draft.video.width % 2 || draft.video.height % 2) return '分辨率宽高需为偶数（H.264 要求）';
+      if (!(draft.video.width > 0) || !(draft.video.height > 0)) return { msg: '输出分辨率不正确', tab: 'video' };
+      if (draft.video.width % 2 || draft.video.height % 2) return { msg: '分辨率宽高需为偶数（H.264 要求）', tab: 'video' };
     }
-    return '';
+    return null;
+  }
+
+  /* 校验失败时把原因直接写在弹窗里，并跳到出问题的标签页 —— 只弹一个角落 toast，用户会以为「点了没反应」 */
+  function showFormError(msg, tab) {
+    const box = entry?.el.querySelector('#jf-error');
+    if (box) {
+      box.hidden = false;
+      box.innerHTML = `${icon('alert', 13)}<span>${h(msg)}</span>`;
+    }
+    if (tab && tab !== activeTab) {
+      activeTab = tab;
+      entry?.el.querySelectorAll('[data-tab]').forEach((x) => x.classList.toggle('active', x.dataset.tab === activeTab));
+      renderTab();
+    }
+    const body = entry?.el.querySelector('.modal-body');
+    if (body) body.scrollTop = 0;
+    toast(msg, 'error', 4200);
+  }
+
+  function clearFormError() {
+    const box = entry?.el.querySelector('#jf-error');
+    if (box) { box.hidden = true; box.innerHTML = ''; }
+  }
+
+  function setSaving(on) {
+    ['#jf-save', '#jf-save-start'].forEach((sel) => {
+      const b = entry?.el.querySelector(sel);
+      if (!b) return;
+      b.disabled = on;
+      if (on) { b.dataset.label = b.textContent; b.textContent = '保存中…'; }
+      else if (b.dataset.label) { b.textContent = b.dataset.label; delete b.dataset.label; }
+    });
   }
 
   async function save(start) {
-    const err = validate();
-    if (err) return toast(err, 'error', 4000);
+    clearFormError();
+    const bad = validate();
+    if (bad) return showFormError(bad.msg, bad.tab);
     const payload = cleanDraft();
     if (start) payload.autoStart = true;
+    setSaving(true);
     try {
       let res;
       if (draft.id) {
@@ -1053,7 +1128,9 @@ SP.jobForm = (() => {
       entry && entry.close();
       callback && callback(res.job);
     } catch (e) {
-      toast(e.message, 'error', 6000);
+      showFormError(e.message || '保存失败');
+    } finally {
+      setSaving(false);
     }
   }
 

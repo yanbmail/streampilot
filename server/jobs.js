@@ -17,7 +17,10 @@ const ERROR_HINTS = [
   [/401 Unauthorized|403 Forbidden/i, '鉴权失败：推流密钥或账号权限不正确'],
   [/404 Not Found/i, '地址不存在：请确认 app / 流名称是否正确'],
   [/Operation not permitted|Permission denied/i, '系统权限不足：macOS 请到「系统设置 → 隐私与安全性 → 屏幕录制/摄像头/麦克风」中授权本应用'],
-  [/Input\/output error/i, '读写错误：源或目标中断，可能是网络抖动或磁盘已满'],
+  [/Configuration of video device failed/i, '摄像头不支持所请求的分辨率/帧率组合：已回退为设备默认参数，若仍黑屏请检查相机权限或设备是否被占用'],
+  [/avfoundation.*(Input\/output error|I\/O error)/i, '摄像头打不开：macOS 相机权限未授权，或设备正被其他程序（会议 / OBS / 微信视频）占用'],
+  [/Selected pixel format .* not supported/i, '摄像头像素格式不受支持：已自动改用设备支持格式，不影响输出'],
+  [/Input\/output error/i, '读写错误：macOS 相机/屏幕可能未授权或被其他程序占用；网络源则可能是地址失效或中断'],
   [/Cannot open display|Could not find video device|No such device/i, '采集设备不可用：请重新选择屏幕或摄像头设备'],
   [/Unknown encoder|Encoder .* not found/i, '编码器不可用：请在设置中更换编码器或安装完整版 FFmpeg'],
   [/Protocol not found/i, '当前 FFmpeg 不支持的协议：请安装带完整协议的 FFmpeg'],
@@ -343,6 +346,25 @@ class JobManager extends EventEmitter {
     const proc = spawn(this.ffmpeg.bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     rt.proc = proc;
 
+    // 本地采集（摄像头/屏幕）如果被系统拒权或被别的程序占用，FFmpeg 会开着进程却永远不吐帧：
+    // 界面上就成了「推流中」但 0 帧、没有输出文件，用户完全看不出问题。这里做一次兜底体检。
+    if (job.source.type === 'camera' || job.source.type === 'screen') {
+      const warmup = setTimeout(() => {
+        if (rt.stopping || !this.running.has(jobId)) return;
+        const st = rt.stats || {};
+        if ((st.frame || 0) > 0 || (st.sizeBytes || 0) > 0) return;
+        const what = job.source.type === 'camera' ? '摄像头' : '屏幕';
+        const why = rt.lastError || `20 秒内没有拿到任何画面`;
+        rt.lastError = `${what}没有输出画面：${why}`;
+        this.log(jobId, `诊断：${rt.lastError}`, 'error');
+        this.log(jobId, `排查建议：macOS 到「系统设置 → 隐私与安全性 → ${job.source.type === 'camera' ? '相机' : '屏幕录制'}」勾选运行 StreamPilot 的应用（终端/iTerm）并重启它；确认${what}没有被其他软件占用（会议、OBS、微信视频等）。`, 'warn');
+        this.emit('state', { jobId, status: 'error', error: rt.lastError });
+        this.stop(jobId).catch(() => {});
+      }, 20000);
+      rt.warmupTimer = warmup;
+      proc.once('exit', () => clearTimeout(warmup));
+    }
+
     const handleChunk = (buf) => {
       const text = buf.toString();
       for (const raw of text.split(/\r?\n|\r/)) {
@@ -430,6 +452,19 @@ class JobManager extends EventEmitter {
         this.log(jobId, '推流已停止', 'ok');
         this.remember(jobId, { status: 'stopped', lastError: '' });
         this.emit('state', { jobId, status: 'stopped' });
+        return;
+      }
+      // 摄像头/屏幕一帧都没出就退出了 —— 基本是系统没授权或设备被占用，重试再多次也没用，
+      // 直接报错并给出排查路径，比无限重连更有用。
+      const localCapture = job.source.type === 'camera' || job.source.type === 'screen';
+      const produced = (rt.stats.frame || 0) > 0 || (rt.stats.sizeBytes || 0) > 0;
+      if (wasRunning && localCapture && !produced) {
+        const what = job.source.type === 'camera' ? '摄像头' : '屏幕';
+        rt.lastError = rt.lastError || `${what}打不开`;
+        this.log(jobId, `诊断：${rt.lastError}`, 'error');
+        this.log(jobId, `排查建议：macOS 打开「系统设置 → 隐私与安全性 → ${job.source.type === 'camera' ? '相机' : '屏幕录制'}」，勾选运行 StreamPilot 的程序（终端 / iTerm / WorkBuddy），改完要退出并重新打开它；同时确认${what}没有被会议、OBS、微信视频等占用。`, 'warn');
+        this.remember(jobId, { status: 'error', lastError: rt.lastError });
+        this.emit('state', { jobId, status: 'error', error: rt.lastError });
         return;
       }
       if (wasRunning && job.advanced.reconnect && (job.advanced.maxReconnect === 0 || rt.restarts < job.advanced.maxReconnect)) {

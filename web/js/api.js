@@ -40,6 +40,7 @@ SP.api = (() => {
     system: () => req('/api/system'),
     redetect: () => req('/api/system/redetect', { method: 'POST' }),
     devices: () => req('/api/devices'),
+    deviceTest: (b) => req('/api/devices/test', { method: 'POST', body: b }),
     caps: () => req('/api/caps'),
     probe: (target, extra = {}) => req('/api/probe', { method: 'POST', body: { target, ...extra } }),
     screenSize: (index) => req(`/api/screen-size?index=${encodeURIComponent(index)}`),

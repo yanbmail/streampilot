@@ -464,7 +464,7 @@ textarea.input { height: auto; min-height: 70px; padding: 9px 11px; resize: vert
 .tabs button.active { color: #fff; border-bottom-color: var(--accent); }
 
 /* ---------------- 提示 / Toast ---------------- */
-.toast-root { position: fixed; right: 20px; bottom: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 300; }
+.toast-root { position: fixed; right: 20px; bottom: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 2000; }
 .toast {
   display: flex; align-items: flex-start; gap: 9px; padding: 11px 14px; min-width: 220px; max-width: 380px;
   background: rgba(22, 32, 45, .96); border: 1px solid var(--line-strong); border-radius: 11px;
@@ -733,3 +733,19 @@ textarea.input { height: auto; min-height: 70px; padding: 9px 11px; resize: vert
   border-bottom: 1px solid var(--line);
   background: rgba(255, 255, 255, .022);
 }
+/* 任务名称：始终可见，新建任务不再是只能叫「新建推流」 */
+.jf-namebar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 16px 0;
+}
+.jf-namebar .input { flex: 1; min-width: 0; font-size: 13px; }
+/* 校验失败的内联错误条：贴在底部按钮上方，比角落 toast 显眼得多 */
+.jf-error {
+  display: flex; align-items: flex-start; gap: 8px;
+  margin: 0 16px 10px; padding: 9px 12px;
+  border-radius: 9px; font-size: 12.5px; line-height: 1.5;
+  color: #ffb3ba; background: rgba(255, 92, 106, .1);
+  border: 1px solid rgba(255, 92, 106, .32);
+}
+.jf-error[hidden] { display: none; }
+.jf-error svg { flex: none; margin-top: 1px; }

@@ -139,6 +139,46 @@ class FFmpegService {
   }
 
   /** 扫描可用采集设备 */
+  /**
+   * 采集设备自检：真正打开设备抓一帧。
+   * 摄像头「能枚举、打不开」在 macOS 上极常见（相机权限未授权 / 被其他软件占用），
+   * 枚举一切正常，只有真去打开才会报 I/O error，所以必须实抓一次。
+   */
+  async testCapture({ type = 'camera', videoDevice, audioDevice, display = 0 } = {}) {
+    const args = ['-hide_banner', '-loglevel', 'error'];
+    if (IS_MAC) {
+      args.push('-f', 'avfoundation');
+      // 屏幕在 avfoundation 里也是「视频设备」，索引由 listDevices 给出
+      if (type === 'screen') args.push('-i', `${videoDevice ?? display}:none`);
+      else args.push('-i', `${videoDevice || '0'}:${audioDevice || 'none'}`);
+    } else if (IS_WIN) {
+      if (type === 'screen') args.push('-f', 'gdigrab', '-i', 'desktop');
+      else args.push('-f', 'dshow', '-i', audioDevice ? `video=${videoDevice}:audio=${audioDevice}` : `video=${videoDevice}`);
+    } else {
+      if (type === 'screen') args.push('-f', 'x11grab', '-i', ':0.0');
+      else args.push('-f', 'v4l2', '-i', videoDevice || '/dev/video0');
+    }
+    args.push('-frames:v', '1', '-f', 'null', '-');
+    const r = await execFileP(this.bin, args, { timeout: 9000 });
+    const text = `${r.stderr}\n${r.stdout}`.trim();
+    if (r.ok) return { ok: true, detail: '设备已成功出图' };
+    let hint = '设备打不开';
+    if (/Input\/output error|I\/O error/i.test(text)) {
+      hint = IS_MAC
+        ? 'macOS 拒绝访问该设备：到「系统设置 → 隐私与安全性 → 相机 / 屏幕录制」勾选运行 StreamPilot 的程序，改完要完全退出并重开它'
+        : '设备被占用或权限不足：关闭其他正在使用它的程序后重试';
+    } else if (/is busy|Device or resource busy/i.test(text)) {
+      hint = '设备正被其他程序占用：先关闭会议 / OBS / 微信视频等再试';
+    } else if (/Selected framerate .* not supported|Configuration of video device failed/i.test(text)) {
+      hint = '设备不支持当前分辨率/帧率组合：换一个采集分辨率试试';
+    } else if (/No such device|Could not find video device/i.test(text)) {
+      hint = '找不到该设备：可能已拔掉，点「刷新设备」重新检测';
+    } else if (/timed out|SIGTERM/i.test(text) || r.error?.killed) {
+      hint = '设备没有任何输出（超时）：多半是权限未授权，或设备被其他程序独占';
+    }
+    return { ok: false, error: hint, raw: text.split('\n').slice(-6).join('\n') };
+  }
+
   async listDevices() {
     if (IS_MAC) {
       const r = await execFileP(this.bin, ['-hide_banner', '-f', 'avfoundation', '-list_devices', 'true', '-i', ''], { timeout: 12000 });
@@ -243,8 +283,11 @@ class FFmpegService {
         const c = s.camera;
         queue(256);
         if (IS_MAC) {
-          input.push('-f', 'avfoundation', '-framerate', String(c.fps));
-          if (c.width && c.height) input.push('-video_size', `${c.width}x${c.height}`);
+          // avfoundation 对 -video_size / -framerate 很挑：设备不支持该组合时会打印
+          // "Configuration of video device failed, falling back to default." 然后卡住不吐帧，
+          // 表现为「任务显示推流中，但 0 帧、没有输出文件」。这里只指定设备，分辨率/帧率
+          // 交给后面的 scale / fps 滤镜处理，任何摄像头都能出画面。
+          input.push('-f', 'avfoundation');
           const vIdx = c.videoDevice || '0';
           const aIdx = c.audioDevice ? c.audioDevice : 'none';
           input.push('-i', `${vIdx}:${aIdx}`);

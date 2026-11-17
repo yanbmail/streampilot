@@ -328,6 +328,18 @@ async function createApp(options = {}) {
         return sendJson(res, 200, { ok: true, devices });
       }
 
+      // 采集设备自检：真去开设备抓一帧，能区分「权限没给」和「设备被占用」
+      if (pathname === '/api/devices/test' && req.method === 'POST') {
+        const body = await readBody(req).catch(() => ({}));
+        const result = await ffmpeg.testCapture({
+          type: body.type === 'screen' ? 'screen' : 'camera',
+          videoDevice: body.videoDevice,
+          audioDevice: body.audioDevice,
+          display: body.display,
+        });
+        return sendJson(res, 200, result);
+      }
+
       if (pathname === '/api/screen-size') {
         const size = await ffmpeg.screenSize(Number(query.index || 0));
         return sendJson(res, 200, size);
