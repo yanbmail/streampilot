@@ -273,6 +273,8 @@ class FFmpegService {
           if (adv.inputReconnect) {
             input.push('-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '8');
           }
+          // 限制探测窗口，避免多码率主清单把每个分支都探一遍（起播慢）
+          input.push('-probesize', '5000000', '-analyzeduration', '5000000');
         } else if (['http', 'flv', 'rtmp', 'rtmps'].includes(kind)) {
           if (adv.inputReconnect) {
             input.push('-reconnect', '1', '-reconnect_streamed', '1',
@@ -406,7 +408,8 @@ class FFmpegService {
       args.push(path.join(dir, 'index.m3u8'));
       // HLS 目标已在上面写入清单路径，不再追加 URL
       return args;
-    } else if (t.muxer === '') {
+    } else if (!tgt.muxer) {
+      // 录制文件：按扩展名推断容器，未识别时退回 matroska
       const ext = path.extname(tgt.url || '').toLowerCase();
       if (ext === '.mp4') args.push('-f', 'mp4', '-movflags', '+faststart');
       else if (ext === '.mkv') args.push('-f', 'matroska');
